@@ -1,1 +1,4 @@
 ese
+.env
+gorm-log.txt
+tmp
