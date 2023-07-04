@@ -734,7 +734,7 @@ RQiDj := (float64(Fi) * (k1 + 1)) / (float64(Fi) + k1*(1-b+b*(float64(Dj)/avgDoc
 
 我在我搞的“翰哥搜索”页面上搜了一下“BM25 算法的数学描述”，结果如下：
 
-![](https://qn.lvwenhan.com/2023-06-30-16880595763406.jpg)
+![](https://qn.lvwenhan.com/2023-07-04-16884473624549.jpg)
 
 我搜索“住范儿”，结果如下：
 
