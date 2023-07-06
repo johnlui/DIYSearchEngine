@@ -462,7 +462,7 @@ dbdb0.SetConnMaxLifetime(time.Hour)
 
 现在我们的爬虫运行架构图应该是下面这样的：
 
-![whiteboard_exported_image -2-](https://qn.lvwenhan.com/2023-06-29-whiteboard_exported_image (2).png)
+![whiteboard_exported_image](https://qn.lvwenhan.com/2023-07-06-whiteboard_exported_image.png)
 
 爬虫搞完了，让我们进入第二大部分。
 
