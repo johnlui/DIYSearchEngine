@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  # MySQL 服务配置
+  mysql:
+    image: mysql:latest
+    restart: always
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: your_root_password
+      MYSQL_DATABASE: your_database_name
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  # Redis 服务配置
+  redis:
+    image: redis:latest
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  # 项目服务配置
+  ese:
+    build:
+      context: .
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mysql
+      - redis
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASSWORD: your_root_password
+      MYSQL_DBNAME: your_database_name
+      REDIS_ADDR: redis:6379
+    volumes:
+      - .:/app
+
+volumes:
+  mysql_data:
+  redis_data:
