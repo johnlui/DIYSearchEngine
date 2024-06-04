@@ -763,8 +763,7 @@ RQiDj := (float64(Fi) * (k1 + 1)) / (float64(Fi) + k1*(1-b+b*(float64(Dj)/avgDoc
 文章结束了，你学废了吗？欢迎到下列位置留下你的评论：
 
 1. Github：https://github.com/johnlui/DIY-Search-Engine
-2. 博客：https://lvwenhan.com/tech-epic/509.html
-
+2. 博客：https://pphc.lvwenhan.com/tech-epic/2023/diy-search-engine
 【全文完】
 
 <hr>
@@ -785,7 +784,7 @@ RQiDj := (float64(Fi) * (k1 + 1)) / (float64(Fi) + k1*(1-b+b*(float64(Dj)/avgDoc
 #### 更多项目运行信息，请见 [wiki](https://github.com/johnlui/DIY-Search-Engine/wiki)
 
 
-#### 网页直接阅读：https://lvwenhan.com/tech-epic/509.html
+#### 网页直接阅读：https://pphc.lvwenhan.com/tech-epic/2023/diy-search-engine
 
 ### 作者信息：
 
