@@ -99,7 +99,7 @@ func InitDB() {
   // 初始化 Redis
   // 默认 Redis，用作缓存
   Rdb = redis.NewClient(&redis.Options{
-    Addr:        os.Getenv("REDIS_HOST") + ":6379",
+    Addr:        os.Getenv("REDIS_HOST") + os.Getenv("REDIS_PORT"),
     Password:    os.Getenv("REDIS_PASSWORD"),
     DB:          0,
     DialTimeout: time.Second,
@@ -107,7 +107,7 @@ func InitDB() {
   })
   // 倒排索引字典生成中转站
   Rdb10 = redis.NewClient(&redis.Options{
-    Addr:        os.Getenv("REDIS_HOST") + ":6379",
+    Addr:        os.Getenv("REDIS_HOST") + os.Getenv("REDIS_PORT"),
     Password:    os.Getenv("REDIS_PASSWORD"),
     DB:          10,
     DialTimeout: time.Second,
