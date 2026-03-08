@@ -1,52 +1,69 @@
 package tools
 
 import (
-  "fmt"
-  "strings"
-  "time"
+	"errors"
+	"io"
+	"net/http"
+	"strings"
+	"time"
 
-  "github.com/PuerkitoBio/goquery"
-  "github.com/imroc/req/v3"
-  "github.com/johnlui/enterprise-search-engine/db"
-  "github.com/johnlui/enterprise-search-engine/models"
+	"github.com/PuerkitoBio/goquery"
+	"github.com/johnlui/enterprise-search-engine/db"
+	"github.com/johnlui/enterprise-search-engine/models"
 )
 
 // 4 秒超时
-var client = req.C().SetTimeout(time.Second * 4).SetRedirectPolicy(req.NoRedirectPolicy())
+var client = &http.Client{
+	Timeout: time.Second * 4,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
 
-func Curl(status models.Status, ch chan int) (*goquery.Document, int) {
-  // Send a request with multiple headers.
-  resp, err := client.R().
-    SetHeader("User-Agent", "Sogou web spider/4.0(+http://www.sogou.com/docs/help/webmasters.htm#07)").
-    Get(status.Url)
-  if err != nil {
-    // fmt.Println("网络错误：", url, err)
-    // fmt.Println(err)
-    document, _ := goquery.NewDocumentFromReader(strings.NewReader(""))
+func Curl(status models.Status) (*goquery.Document, int) {
+	req, err := http.NewRequest(http.MethodGet, status.Url, nil)
+	if err != nil {
+		return curlFailureResult(status)
+	}
+	req.Header.Set("User-Agent", "Sogou web spider/4.0(+http://www.sogou.com/docs/help/webmasters.htm#07)")
 
-    // 网络错误则使用Redis判断次数，达到3次则标记为 craw_donw
-    key := "ese_spider_wangluocuowu_" + GetMD5Hash(status.Url)
+	resp, err := client.Do(req)
+	if err != nil {
+		return curlFailureResult(status)
+	}
+	defer resp.Body.Close()
 
-    count, err := db.Rdb.Get(db.Ctx, key).Int()
-    if err == nil {
-      if count >= 2 { // 超时放弃次数
-        return document, 4
-      }
-    }
+	body, err := io.ReadAll(resp.Body)
+	if err != nil && !errors.Is(err, io.EOF) {
+		document, _ := goquery.NewDocumentFromReader(strings.NewReader(""))
+		return document, 3
+	}
 
-    db.Rdb.IncrBy(db.Ctx, key, 1).Err()
-    db.Rdb.Expire(db.Ctx, key, time.Hour*240).Err()
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+	if err != nil {
+		document, _ := goquery.NewDocumentFromReader(strings.NewReader(""))
+		return document, 3
+	}
 
-    return document, 2
-  }
-  html := resp.String()
-  doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
-  if err != nil {
-    fmt.Println("HTML解析失败：", status.Url, err)
-    // fmt.Println(err)
-    document, _ := goquery.NewDocumentFromReader(strings.NewReader(""))
-    return document, 3
-  }
+	return doc, 1
+}
 
-  return doc, 1
+var countCurlFailure = func(status models.Status) int {
+	// 网络错误则使用Redis判断次数，达到3次则标记为 craw_done
+	key := "ese_spider_wangluocuowu_" + GetMD5Hash(status.Url)
+
+	count, err := db.Rdb.Get(db.Ctx, key).Int()
+	if err == nil && count >= 2 { // 超时放弃次数
+		return 4
+	}
+
+	db.Rdb.IncrBy(db.Ctx, key, 1).Err()
+	db.Rdb.Expire(db.Ctx, key, time.Hour*240).Err()
+
+	return 2
+}
+
+func curlFailureResult(status models.Status) (*goquery.Document, int) {
+	document, _ := goquery.NewDocumentFromReader(strings.NewReader(""))
+	return document, countCurlFailure(status)
 }

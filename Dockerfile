@@ -4,6 +4,9 @@ FROM golang:latest AS builder
 # 设置工作目录
 WORKDIR /app
 
+# gojieba 需要 g++ 编译其 CGO 部分
+RUN apt-get update && apt-get install -y g++ && rm -rf /var/lib/apt/lists/*
+
 # 拷贝项目文件到工作目录
 COPY . .
 
