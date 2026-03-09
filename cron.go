@@ -6,9 +6,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/johnlui/enterprise-search-engine/db"
 	"github.com/johnlui/enterprise-search-engine/models"
 	"github.com/johnlui/enterprise-search-engine/tools"
@@ -56,42 +58,9 @@ func prepareStatusesBackground() {
 		}
 	}
 
-	count := 0
-
-	for i := 0; i < 256; i++ {
-		tableName := tools.HexTableName("status", i)
-
-		realDB := db.DbInstance0
-
-		var _statusArray []models.Status
-		key := "table_" + tableName + "_max_into_queue_id"
-		maxID, _ := db.Rdb.Get(db.Ctx, key).Int()
-		realDB.Table(tableName).
-			Where("craw_done", 0).
-			Where("host not in (?)", hostBlackListInOneStepArray).
-			Where("id > ?", maxID).
-			Order("id").Limit(maxNumber).Find(&_statusArray)
-
-		if len(_statusArray) > 0 {
-			count += len(_statusArray)
-
-			for _, v := range _statusArray {
-				taskBytes, _ := json.Marshal(v)
-				db.Rdb.LPush(db.Ctx, "need_craw_list", taskBytes)
-			}
-
-			keyTTL, _ := db.Rdb.TTL(db.Ctx, key).Result()
-			if keyTTL == -1 {
-				keyTTL = time.Hour
-			}
-
-			err := db.Rdb.Set(db.Ctx, key, _statusArray[len(_statusArray)-1].ID, keyTTL).Err()
-			if err != nil {
-				dd(err)
-			}
-		}
-
-	}
+	count := runWorkerPool(256, 8, func(i int) int {
+		return enqueueStatusesForTable(i, maxNumber, hostBlackListInOneStepArray)
+	})
 
 	if count > 0 {
 		fmt.Println("准备完一轮数据", time.Now().Unix()-t.Unix(), "秒，共", maxNumber*256, "条")
@@ -163,32 +132,15 @@ func refreshHostCount() {
 // 将分词结果洗到 redis DB10 里面
 func washHTMLToDB10() {
 	t := time.Now()
-	chs := make([]chan int, 256)
-	for i := 0; i < 256; i++ {
-		tableName := tools.HexTableName("pages", i)
-
-		realDB := db.DbInstance0
-
-		chs[i] = make(chan int)
-		go asyncGenerateDics(i, realDB, tableName, chs[i])
-	}
-	total := 0
-	for _, ch := range chs {
-		total += <-ch
-	}
+	total := runWorkerPool(256, 16, func(i int) int {
+		return generateDicsForTable(i, db.DbInstance0, tools.HexTableName("pages", i))
+	})
 
 	if total > 0 {
 		fmt.Println("将分词结果洗到 redis 里完成", time.Now().Unix()-t.Unix(), "秒", total, "条，启动时间", t.Format("2006-01-02 15:04:05"))
 	}
 
-	// 刷新字符黑名单
-
-	_wordBlackList := []string{}
-	db.DbInstance0.Raw("select word from word_black_list").Scan(&_wordBlackList)
-	wordBlackList = make(map[string]struct{})
-	for _, v := range _wordBlackList {
-		wordBlackList[v] = struct{}{}
-	}
+	reloadWordBlacklist()
 }
 
 type WordAndSppendSrting struct {
@@ -231,31 +183,25 @@ func transferWordDicsBatch() bool {
 	t := time.Now()
 	oneStep := 一步转移的字典条数
 
-	chs := make([]chan WordAndSppendSrting, oneStep)
-	for j := 0; j < oneStep; j++ {
-		chs[j] = make(chan WordAndSppendSrting)
-		go asyncGetWordAndSppendSrting(chs[j])
-	}
-
-	for _, ch := range chs {
-		_result := <-ch
-		if _result.word == "" {
-			continue
+	var mu sync.Mutex
+	runWorkerPool(oneStep, 32, func(_ int) int {
+		result := getWordAndSppendSrting()
+		if result.word == "" {
+			return 0
 		}
-		needUpdate[_result.word] += _result.appendString
-	}
+
+		mu.Lock()
+		needUpdate[result.word] += result.appendString
+		mu.Unlock()
+		return 1
+	})
 
 	fmt.Println("开始插入数据库")
-	db.DbInstanceDic.Connection(func(tx *gorm.DB) error {
-		tx.Exec(`START TRANSACTION`)
-
+	db.DbInstanceDic.Transaction(func(tx *gorm.DB) error {
 		for w, s := range needUpdate {
 			tx.Exec(`UPDATE word_dics
       SET positions = concat(ifnull(positions,''), ?) where name = ?`, s, w)
 		}
-
-		tx.Exec(`COMMIT`)
-
 		return nil
 	})
 
@@ -266,36 +212,54 @@ func transferWordDicsBatch() bool {
 	return len(needUpdate) > 0
 }
 
-func asyncGetWordAndSppendSrting(ch chan WordAndSppendSrting) {
+func getWordAndSppendSrting() WordAndSppendSrting {
 	wordAndSppendSrting := WordAndSppendSrting{}
 
 	word := db.Rdb10.RandomKey(db.Ctx).Val()
-	len := db.Rdb10.LLen(db.Ctx, word).Val()
-	if len > 0 {
-		// fmt.Println(word, "长度", len)
-		if !db.Rdb.HExists(db.Ctx, "HasBeenTransported", word).Val() {
-			db.DbInstanceDic.Exec(`INSERT IGNORE INTO word_dics
-                        SET name = ?,
-                        positions = ''`, word)
-		}
-		db.Rdb.HSet(db.Ctx, "HasBeenTransported", word, "")
-
-		stringNeedAdd := ""
-		var i int64 = 0
-		for i < len {
-			if i >= 每个词转移的深度 {
-				break
-			}
-			stringNeedAdd += db.Rdb10.LPop(db.Ctx, word).Val()
-			i += 1
-		}
-		wordAndSppendSrting.word = word
-		wordAndSppendSrting.appendString = stringNeedAdd
+	if word == "" {
+		return wordAndSppendSrting
 	}
 
-	ch <- wordAndSppendSrting
+	listLength := db.Rdb10.LLen(db.Ctx, word).Val()
+	if listLength <= 0 {
+		return wordAndSppendSrting
+	}
+
+	if !db.Rdb.HExists(db.Ctx, "HasBeenTransported", word).Val() {
+		db.DbInstanceDic.Exec(`INSERT IGNORE INTO word_dics
+                        SET name = ?,
+                        positions = ''`, word)
+	}
+	db.Rdb.HSet(db.Ctx, "HasBeenTransported", word, "")
+
+	limit := listLength
+	if limit > 每个词转移的深度 {
+		limit = 每个词转移的深度
+	}
+
+	var valuesCmd *redis.StringSliceCmd
+	_, _ = db.Rdb10.TxPipelined(db.Ctx, func(pipe redis.Pipeliner) error {
+		valuesCmd = pipe.LRange(db.Ctx, word, 0, limit-1)
+		pipe.LTrim(db.Ctx, word, limit, -1)
+		return nil
+	})
+
+	values, err := valuesCmd.Result()
+	if err != nil || len(values) == 0 {
+		return wordAndSppendSrting
+	}
+
+	var builder strings.Builder
+	for _, value := range values {
+		builder.WriteString(value)
+	}
+
+	wordAndSppendSrting.word = word
+	wordAndSppendSrting.appendString = builder.String()
+	return wordAndSppendSrting
 }
-func asyncGenerateDics(i int, realDB *gorm.DB, tableName string, ch chan int) {
+
+func generateDicsForTable(i int, realDB *gorm.DB, tableName string) int {
 	var lakes []models.Page
 	realDB.Table(tableName).
 		Where("dic_done = 0").
@@ -364,10 +328,57 @@ func asyncGenerateDics(i int, realDB *gorm.DB, tableName string, ch chan int) {
 		realDB.Table(tableName).Save(&lake)
 	}
 
-	ch <- len(lakes)
+	return len(lakes)
 }
 
 type WordResult struct {
 	count     int
 	positions []string
+}
+
+func enqueueStatusesForTable(i, maxNumber int, hostBlackListInOneStepArray []string) int {
+	tableName := tools.HexTableName("status", i)
+
+	var statusArray []models.Status
+	key := "table_" + tableName + "_max_into_queue_id"
+	maxID, _ := db.Rdb.Get(db.Ctx, key).Int()
+	db.DbInstance0.Table(tableName).
+		Where("craw_done", 0).
+		Where("host not in (?)", hostBlackListInOneStepArray).
+		Where("id > ?", maxID).
+		Order("id").Limit(maxNumber).Find(&statusArray)
+
+	if len(statusArray) == 0 {
+		return 0
+	}
+
+	taskBytes := make([]any, 0, len(statusArray))
+	for _, status := range statusArray {
+		payload, _ := json.Marshal(status)
+		taskBytes = append(taskBytes, payload)
+	}
+	if err := db.Rdb.LPush(db.Ctx, "need_craw_list", taskBytes...).Err(); err != nil {
+		dd(err)
+	}
+
+	keyTTL, _ := db.Rdb.TTL(db.Ctx, key).Result()
+	if keyTTL == -1 {
+		keyTTL = time.Hour
+	}
+
+	if err := db.Rdb.Set(db.Ctx, key, statusArray[len(statusArray)-1].ID, keyTTL).Err(); err != nil {
+		dd(err)
+	}
+
+	return len(statusArray)
+}
+
+func reloadWordBlacklist() {
+	words := []string{}
+	db.DbInstance0.Raw("select word from word_black_list").Scan(&words)
+
+	wordBlackList = make(map[string]struct{}, len(words))
+	for _, word := range words {
+		wordBlackList[word] = struct{}{}
+	}
 }

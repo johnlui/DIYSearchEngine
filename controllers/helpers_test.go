@@ -29,6 +29,57 @@ func TestSortDocKeysByScore(t *testing.T) {
 	}
 }
 
+func TestUniqueStrings(t *testing.T) {
+	got := uniqueStrings([]string{"foo", "bar", "foo", "", "baz", "bar"})
+	want := []string{"foo", "bar", "baz"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("uniqueStrings() = %v, want %v", got, want)
+	}
+}
+
+func TestParseBestDocParts(t *testing.T) {
+	got := parseBestDocParts("-1,2,3,10,0-1,2,5,10,4-2,8,1,20,7-bad-")
+	if len(got) != 2 {
+		t.Fatalf("parseBestDocParts() len = %d", len(got))
+	}
+
+	parts := map[string]docPart{}
+	for _, part := range got {
+		parts[part.docKey] = part
+	}
+
+	if part := parts["1-2"]; part.termFrequency != 5 || part.docLength != 10 {
+		t.Fatalf("unexpected part for 1-2: %#v", part)
+	}
+	if part := parts["2-8"]; part.termFrequency != 1 || part.docLength != 20 {
+		t.Fatalf("unexpected part for 2-8: %#v", part)
+	}
+}
+
+func TestTopDocKeysByScore(t *testing.T) {
+	got := topDocKeysByScore(map[string]float64{
+		"a": 1,
+		"b": 5,
+		"c": 3,
+		"d": 4,
+	}, 3)
+	want := []string{"b", "d", "c"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("topDocKeysByScore() = %v, want %v", got, want)
+	}
+}
+
+func TestParseDocKey(t *testing.T) {
+	tableIndex, docID, ok := parseDocKey("12-345")
+	if !ok || tableIndex != 12 || docID != 345 {
+		t.Fatalf("parseDocKey() = (%d, %d, %v)", tableIndex, docID, ok)
+	}
+
+	if _, _, ok := parseDocKey("bad"); ok {
+		t.Fatal("expected malformed doc key to fail")
+	}
+}
+
 func TestBriefForSearchResult(t *testing.T) {
 	if got := briefForSearchResult("abc中文123"); got != "中" {
 		t.Fatalf("briefForSearchResult() = %q", got)

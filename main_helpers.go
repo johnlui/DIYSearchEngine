@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/johnlui/enterprise-search-engine/db"
 	"github.com/johnlui/enterprise-search-engine/models"
 	"github.com/johnlui/enterprise-search-engine/tools"
@@ -86,27 +87,42 @@ func runNextStep(startAt time.Time) (time.Time, bool) {
 		fmt.Println("HTML解析失败", results[3], "条")
 	}
 
-	key := tools.MinuteBucketKey("ese_spider_result_in_minute_", time.Now())
-	db.Rdb.IncrBy(db.Ctx, key, int64(results[1])).Err()
-	db.Rdb.Expire(db.Ctx, key, time.Hour).Err()
+	now := time.Now()
+	pipe := db.Rdb.Pipeline()
+	key := tools.MinuteBucketKey("ese_spider_result_in_minute_", now)
+	pipe.IncrBy(db.Ctx, key, int64(results[1]))
+	pipe.Expire(db.Ctx, key, time.Hour)
 
-	key1 := tools.MinuteBucketKey("ese_spider_result_4_in_minute_", time.Now())
-	db.Rdb.IncrBy(db.Ctx, key1, int64(results[4])).Err()
-	db.Rdb.Expire(db.Ctx, key1, time.Hour).Err()
+	key1 := tools.MinuteBucketKey("ese_spider_result_4_in_minute_", now)
+	pipe.IncrBy(db.Ctx, key1, int64(results[4]))
+	pipe.Expire(db.Ctx, key1, time.Hour)
+	_, _ = pipe.Exec(db.Ctx)
 
-	return time.Now(), true
+	return now, true
 }
 
 func loadStatusesForCrawling() []models.Status {
-	statusArr := make([]models.Status, 0)
-
 	maxNumber := 1
 	if os.Getenv("APP_DEBUG") == "false" {
 		maxNumber = 一次爬取
 	}
 
-	for i := 0; i < 256*maxNumber; i++ {
-		jsonString := db.Rdb.RPop(db.Ctx, "need_craw_list").Val()
+	popCount := 256 * maxNumber
+	statusArr := make([]models.Status, 0, popCount)
+
+	pipe := db.Rdb.Pipeline()
+	cmds := make([]*redis.StringCmd, popCount)
+	for i := 0; i < popCount; i++ {
+		cmds[i] = pipe.RPop(db.Ctx, "need_craw_list")
+	}
+	_, _ = pipe.Exec(db.Ctx)
+
+	for _, cmd := range cmds {
+		jsonString, err := cmd.Result()
+		if err != nil {
+			continue
+		}
+
 		var status models.Status
 		if err := json.Unmarshal([]byte(jsonString), &status); err != nil {
 			continue
