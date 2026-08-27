@@ -25,6 +25,13 @@ var Ctx = context.Background()
 var Rdb *redis.Client
 var Rdb10 *redis.Client
 
+var openDB = mustOpenDB
+var configurePool = configureDBPool
+var createRedisClient = newRedisClient
+var pingRedis = mustPingRedis
+var makeMysqlDialector = mysql.Open
+var openGorm = gorm.Open
+
 func InitDB() {
 	// 初始化 GORM
 
@@ -72,25 +79,25 @@ func InitDB() {
 		Logger: fileLogger,
 	}
 
-	DbInstance0 = mustOpenDB("pages", dsn0, &gormConfig)
+	DbInstance0 = openDB("pages", dsn0, &gormConfig)
 	// DbInstance1 = mustOpenDB("pages-1", dsn1, &gormConfig)
-	DbInstanceDic = mustOpenDB("dictionary", dsnDic, &gormConfig)
+	DbInstanceDic = openDB("dictionary", dsnDic, &gormConfig)
 
-	configureDBPool("pages", DbInstance0, 1, 20)
-	configureDBPool("dictionary", DbInstanceDic, 1, 20)
+	configurePool("pages", DbInstance0, 1, 20)
+	configurePool("dictionary", DbInstanceDic, 1, 20)
 
 	// 初始化 Redis
 	// 默认 Redis，用作缓存
-	Rdb = newRedisClient(0)
+	Rdb = createRedisClient(0)
 	// 倒排索引字典生成中转站
-	Rdb10 = newRedisClient(10)
+	Rdb10 = createRedisClient(10)
 
-	mustPingRedis("redis-0", Rdb)
-	mustPingRedis("redis-10", Rdb10)
+	pingRedis("redis-0", Rdb)
+	pingRedis("redis-10", Rdb10)
 }
 
 func mustOpenDB(name, dsn string, gormConfig *gorm.Config) *gorm.DB {
-	dbInstance, err := gorm.Open(mysql.Open(dsn), gormConfig)
+	dbInstance, err := openGorm(makeMysqlDialector(dsn), gormConfig)
 	if err != nil {
 		log.Fatalf("open %s db: %v", name, err)
 	}

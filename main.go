@@ -31,30 +31,47 @@ var 每分钟每个表执行分词 = 2
 var 一步转移的字典条数 = 2000
 var 每个词转移的深度 int64 = 10000
 
-func main() {
-	// 处理启动参数
-	flag.Parse()
-
-	// 加载 .env
-	initENV()
-
-	// 初始化结巴分词
-	initJieba()
-
-	// 初始化数据库
-	db.InitDB()
-
-	// Art 命令行工具
-	initArtCommands()
-
-	// 启动 web 页面
-	go startServer()
-
-	// 定时任务
-	c := cron.New(
+var parseFlags = flag.Parse
+var initializeENV = initENV
+var initializeJieba = initJieba
+var initializeDB = db.InitDB
+var initializeArtCommands = initArtCommands
+var launchServer = startServer
+var createCron = func() *cron.Cron {
+	return cron.New(
 		cron.WithSeconds(),
 		cron.WithChain(cron.SkipIfStillRunning(cron.DefaultLogger)),
 	)
+}
+var startCron = func(c *cron.Cron) { c.Start() }
+var runDictionaryWash = washDB10ToDicMySQL
+var runSpider = nextStep
+var blockMain = func() { select {} }
+var artCommandFactory = artCommands
+var debugDump = tools.DD
+var runNextStepOnce = runNextStep
+
+func main() {
+	// 处理启动参数
+	parseFlags()
+
+	// 加载 .env
+	initializeENV()
+
+	// 初始化结巴分词
+	initializeJieba()
+
+	// 初始化数据库
+	initializeDB()
+
+	// Art 命令行工具
+	initializeArtCommands()
+
+	// 启动 web 页面
+	go launchServer()
+
+	// 定时任务
+	c := createCron()
 	// 自动从 pages 复制数据到 status
 	c.AddFunc("*/20 * * * * *", autoParsePagesToStatus)
 	// 将可以爬的 URL 插入 Redis
@@ -65,20 +82,20 @@ func main() {
 	c.AddFunc("25 * * * * *", washHTMLToDB10)
 	// 字典从 Redis 批量插入 MySQL
 	c.AddFunc("*/6 * * * * *", washDB10ToDicMySQL)
-	go c.Start()
+	go startCron(c)
 
 	// 生产环境专用
 	if !tools.ENV_DEBUG {
-		washDB10ToDicMySQL()
+		runDictionaryWash()
 	}
 	/*
 	   spider
 	*/
 	// 开始爬
-	nextStep(time.Now())
+	runSpider(time.Now())
 
 	// 阻塞，不跑爬虫时用于阻塞主线程
-	select {}
+	blockMain()
 }
 
 func initENV() {
@@ -97,12 +114,12 @@ func initArtCommands() {
 		return
 	}
 
-	commands := artCommands(Art{})
+	commands := artCommandFactory(Art{})
 	if !runArtCommand(commands, argsWithProg[1:]) {
-		tools.DD("命令不存在")
+		debugDump("命令不存在")
 	}
 
-	tools.DD("命令执行结束，退出")
+	debugDump("命令执行结束，退出")
 }
 func initJieba() {
 	dictDir := path.Join(filepath.Dir(os.Args[0]), "dict")
@@ -112,7 +129,7 @@ func initJieba() {
 // 循环爬
 func nextStep(t time.Time) {
 	for {
-		startAt, shouldContinue := runNextStep(t)
+		startAt, shouldContinue := runNextStepOnce(t)
 		t = startAt
 		if !shouldContinue {
 			return
@@ -177,8 +194,7 @@ func craw(status models.Status, ch chan int, index int) {
 	// fmt.Println("正常结束", time.Now().UnixMilli()-t.UnixMilli(), "毫秒")
 }
 
-func startServer() {
-
+func buildRouter() *gin.Engine {
 	router := gin.Default()
 
 	router.LoadHTMLGlob("views/*")
@@ -186,7 +202,11 @@ func startServer() {
 	// router.GET("/", _transStatus)
 	router.GET("/", controllers.Search)
 	router.GET("/status", controllers.SpiderStatus)
-	router.Run(":" + os.Getenv("PORT"))
+	return router
+}
+
+func startServer() {
+	buildRouter().Run(":" + os.Getenv("PORT"))
 }
 
 func statusHostCrawIsTooMuch(host string) bool {
@@ -240,5 +260,5 @@ func md5Table(url string, table string) func(tx *gorm.DB) *gorm.DB {
 }
 
 func dd(v ...any) {
-	tools.DD(v...)
+	debugDump(v...)
 }

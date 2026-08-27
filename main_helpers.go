@@ -14,6 +14,8 @@ import (
 
 type artCommand func(...string)
 
+var sleep = time.Sleep
+
 func artCommands(a Art) map[string]artCommand {
 	return map[string]artCommand{
 		"init": func(_ ...string) {
@@ -46,7 +48,7 @@ func runNextStep(startAt time.Time) (time.Time, bool) {
 	}
 	if _stop == 1 {
 		fmt.Println("全局开关关闭，30秒后再检测")
-		time.Sleep(time.Second * 30)
+		sleep(time.Second * 30)
 		return time.Now(), true
 	}
 
@@ -67,7 +69,7 @@ func runNextStep(startAt time.Time) (time.Time, bool) {
 	fmt.Println("本轮数据共", validCount, "条")
 	if validCount == 0 {
 		fmt.Println("本轮无数据，60秒后再检测")
-		time.Sleep(time.Minute)
+		sleep(time.Minute)
 		return time.Now(), true
 	}
 

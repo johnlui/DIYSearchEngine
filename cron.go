@@ -18,9 +18,11 @@ import (
 	"gorm.io/gorm"
 )
 
+var currentTime = time.Now
+
 // 后台定时自动同步 pages 表到 status 表
 func autoParsePagesToStatus() {
-	t := time.Now()
+	t := currentTime()
 
 	var count int64 = 0
 
@@ -35,13 +37,13 @@ func autoParsePagesToStatus() {
 		count += result.RowsAffected
 	}
 	if count > 0 {
-		fmt.Println("从 pages 同步了一批数据到 status", time.Now().Unix()-t.Unix(), "秒，共", count, "条")
+		fmt.Println("从 pages 同步了一批数据到 status", currentTime().Unix()-t.Unix(), "秒，共", count, "条")
 	}
 }
 
 // 定时将可以爬的 URL 从 status 表转移到 redis 中
 func prepareStatusesBackground() {
-	t := time.Now()
+	t := currentTime()
 
 	maxNumber := 1
 	if os.Getenv("APP_DEBUG") == "false" {
@@ -63,13 +65,13 @@ func prepareStatusesBackground() {
 	})
 
 	if count > 0 {
-		fmt.Println("准备完一轮数据", time.Now().Unix()-t.Unix(), "秒，共", maxNumber*256, "条")
+		fmt.Println("准备完一轮数据", currentTime().Unix()-t.Unix(), "秒，共", maxNumber*256, "条")
 	}
 }
 
 // 每天刷新一次 已爬 host 数量
 func refreshHostCount() {
-	t := time.Now()
+	t := currentTime()
 	fmt.Println("开始刷新URL数")
 
 	minutesInDay := t.Hour()*60 + t.Minute()
@@ -89,7 +91,7 @@ func refreshHostCount() {
 		_hostCountArr := []models.HostCount{}
 		realDB.Raw("select host, count(*) count from " + tableName + " where host is not null group by host having count > 500").Scan(&_hostCountArr)
 
-		key := "host_counts_all_" + strconv.Itoa(int(time.Now().Unix())/86400)
+		key := "host_counts_all_" + strconv.Itoa(int(currentTime().Unix())/86400)
 		for _, v := range _hostCountArr {
 			db.Rdb.HIncrBy(db.Ctx, key, v.Host, int64(v.Count))
 		}
@@ -104,7 +106,7 @@ func refreshHostCount() {
 		_hostCountArr := []models.HostCount{}
 		realDB.Raw("select host, count(*) crawd_count from " + tableName + " where craw_done = 1 and host is not null group by host").Scan(&_hostCountArr)
 
-		key := "host_counts_crawd_" + strconv.Itoa(int(time.Now().Unix())/86400)
+		key := "host_counts_crawd_" + strconv.Itoa(int(currentTime().Unix())/86400)
 		for _, v := range _hostCountArr {
 			db.Rdb.HIncrBy(db.Ctx, key, v.Host, int64(v.CrawdCount))
 		}
@@ -119,25 +121,25 @@ func refreshHostCount() {
 		_hostCountArr := []models.HostCount{}
 		realDB.Raw("select host, count(*) crawd_count from " + tableName + " where craw_done = 1 and text = '' and host is not null group by host").Scan(&_hostCountArr)
 
-		key := "host_counts_crawd_invalid_" + strconv.Itoa(int(time.Now().Unix())/86400)
+		key := "host_counts_crawd_invalid_" + strconv.Itoa(int(currentTime().Unix())/86400)
 		for _, v := range _hostCountArr {
 			db.Rdb.HIncrBy(db.Ctx, key, v.Host, int64(v.CrawdCount))
 		}
 		db.Rdb.Expire(db.Ctx, key, time.Hour*48).Err()
 	}
 
-	fmt.Println("刷新URL数完成：start", start, "end", end, time.Now().Unix()-t.Unix(), "秒")
+	fmt.Println("刷新URL数完成：start", start, "end", end, currentTime().Unix()-t.Unix(), "秒")
 }
 
 // 将分词结果洗到 redis DB10 里面
 func washHTMLToDB10() {
-	t := time.Now()
+	t := currentTime()
 	total := runWorkerPool(256, 16, func(i int) int {
 		return generateDicsForTable(i, db.DbInstance0, tools.HexTableName("pages", i))
 	})
 
 	if total > 0 {
-		fmt.Println("将分词结果洗到 redis 里完成", time.Now().Unix()-t.Unix(), "秒", total, "条，启动时间", t.Format("2006-01-02 15:04:05"))
+		fmt.Println("将分词结果洗到 redis 里完成", currentTime().Unix()-t.Unix(), "秒", total, "条，启动时间", t.Format("2006-01-02 15:04:05"))
 	}
 
 	reloadWordBlacklist()
@@ -159,7 +161,7 @@ func washDB10ToDicMySQL() {
 		}
 		if _stop == 1 {
 			fmt.Println("全局开关关闭，60秒后再检测")
-			time.Sleep(time.Second * 60)
+			sleep(time.Second * 60)
 			continue
 		}
 
@@ -180,7 +182,7 @@ func transferWordDicsBatch() bool {
 	// 5. 插入之前监测一下词是否已入库，若从未入库，则执行创建语句，若已入库，跳过
 	// 6. 使用事务批量执行 update
 	needUpdate := make(map[string]string)
-	t := time.Now()
+	t := currentTime()
 	oneStep := 一步转移的字典条数
 
 	var mu sync.Mutex
