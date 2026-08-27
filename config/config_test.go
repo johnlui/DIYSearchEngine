@@ -35,3 +35,18 @@ func TestLoadRedisAddressVariants(t *testing.T) {
 		t.Fatalf("redis addr override = %q", got)
 	}
 }
+
+func TestLoadInvalidIntegerFallbacksAndRedisWithDB(t *testing.T) {
+	t.Setenv("DB_MAX_IDLE_CONNS", "bad")
+	t.Setenv("DB_MAX_OPEN_CONNS", "also-bad")
+	t.Setenv("REDIS_DIAL_TIMEOUT_SECONDS", "bad")
+
+	cfg := Load()
+	if cfg.PagesDB.MaxIdle != 1 || cfg.PagesDB.MaxOpen != 20 || cfg.Redis.DialSeconds != 1 {
+		t.Fatalf("fallback integer config = %#v", cfg)
+	}
+	redis := cfg.RedisWithDB(3)
+	if redis.DB != 3 || redis.Addr != cfg.Redis.Addr || redis.Password != cfg.Redis.Password {
+		t.Fatalf("RedisWithDB() = %#v, base = %#v", redis, cfg.Redis)
+	}
+}

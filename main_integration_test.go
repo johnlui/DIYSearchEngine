@@ -2,11 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -14,6 +14,7 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/alicebob/miniredis/v2"
+	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
 	"github.com/johnlui/enterprise-search-engine/db"
 	"github.com/johnlui/enterprise-search-engine/models"
@@ -242,6 +243,192 @@ func TestRunAllRolesStartsSpiderWhenIndexerBlocks(t *testing.T) {
 		t.Fatal("spider did not start while indexer was blocked")
 	}
 	close(releaseIndexer)
+}
+
+func TestRunRoleDispatchesSpecificRoles(t *testing.T) {
+	originalLaunchServer := launchServer
+	originalCreateCron := createCron
+	originalStartCron := startCron
+	originalRunDictionaryWash := runDictionaryWash
+	originalRunSpider := runSpider
+	originalBlockMain := blockMain
+	defer func() {
+		launchServer = originalLaunchServer
+		createCron = originalCreateCron
+		startCron = originalStartCron
+		runDictionaryWash = originalRunDictionaryWash
+		runSpider = originalRunSpider
+		blockMain = originalBlockMain
+	}()
+
+	calls := map[string]int{}
+	cronStarted := make(chan struct{})
+	launchServer = func() { calls["serve"]++ }
+	createCron = func() *cron.Cron {
+		calls["createCron"]++
+		return cron.New(cron.WithSeconds())
+	}
+	startCron = func(*cron.Cron) { close(cronStarted) }
+	runDictionaryWash = func() { calls["indexer"]++ }
+	runSpider = func(time.Time) { calls["crawler"]++ }
+	blockMain = func() { calls["block"]++ }
+
+	for _, role := range []string{"serve", "crawler", "scheduler", "indexer", "unknown"} {
+		runRole(role)
+	}
+	select {
+	case <-cronStarted:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not start cron")
+	}
+
+	for _, key := range []string{"serve", "crawler", "createCron", "block", "indexer"} {
+		if calls[key] != 1 {
+			t.Fatalf("%s calls = %d, want 1; all calls = %#v", key, calls[key], calls)
+		}
+	}
+}
+
+func TestConfigureServicesUsesRedisCurlFailureCounter(t *testing.T) {
+	originalPagesDB := db.DbInstance0
+	originalDictionaryDB := db.DbInstanceDic
+	originalRedis := db.Rdb
+	originalIndexRedis := db.Rdb10
+	t.Cleanup(func() {
+		db.DbInstance0 = originalPagesDB
+		db.DbInstanceDic = originalDictionaryDB
+		db.Rdb = originalRedis
+		db.Rdb10 = originalIndexRedis
+		tools.SetCurlFailureCounter(nil)
+	})
+	setupMainRedis(t)
+
+	configureServices()
+	status := models.Status{Url: "https://fail-counter.example"}
+	if got := countCurlFailureWithRedis(status); got != 2 {
+		t.Fatalf("first countCurlFailureWithRedis() = %d, want 2", got)
+	}
+	if got := countCurlFailureWithRedis(status); got != 2 {
+		t.Fatalf("second countCurlFailureWithRedis() = %d, want 2", got)
+	}
+	if got := countCurlFailureWithRedis(status); got != 4 {
+		t.Fatalf("third countCurlFailureWithRedis() = %d, want 4", got)
+	}
+}
+
+func TestLoadStatusesForCrawlingUsesConfiguredBatchInProduction(t *testing.T) {
+	originalRedis := db.Rdb
+	originalIndexRedis := db.Rdb10
+	originalBatch := 一次爬取
+	t.Cleanup(func() {
+		db.Rdb = originalRedis
+		db.Rdb10 = originalIndexRedis
+		一次爬取 = originalBatch
+	})
+	setupMainRedis(t)
+	t.Setenv("APP_DEBUG", "false")
+	一次爬取 = 2
+
+	for _, status := range []models.Status{
+		{ID: 1, Url: "https://one.example", Host: "one.example"},
+		{ID: 2, Url: "https://two.example", Host: "two.example"},
+		{ID: 3, Url: "https://three.example", Host: "three.example"},
+	} {
+		payload, err := json.Marshal(status)
+		if err != nil {
+			t.Fatalf("marshal status: %v", err)
+		}
+		db.Rdb.LPush(db.Ctx, "need_craw_list", payload)
+	}
+
+	statuses := loadStatusesForCrawling()
+	if len(statuses) != 3 {
+		t.Fatalf("loadStatusesForCrawling() len = %d, want 3", len(statuses))
+	}
+}
+
+func TestDebugDumpWrapper(t *testing.T) {
+	originalDebugDump := debugDump
+	defer func() {
+		debugDump = originalDebugDump
+	}()
+
+	called := false
+	debugDump = func(v ...any) {
+		called = len(v) == 1 && v[0] == "value"
+	}
+	dd("value")
+	if !called {
+		t.Fatal("expected dd to call debugDump")
+	}
+}
+
+func TestStartServerUsesConfiguredPortAndReportsRunErrors(t *testing.T) {
+	originalConfig := activeConfig
+	originalRunRouter := runRouter
+	originalDebugDump := debugDump
+	t.Cleanup(func() {
+		activeConfig = originalConfig
+		runRouter = originalRunRouter
+		debugDump = originalDebugDump
+	})
+
+	addrs := []string{}
+	runRouter = func(_ *gin.Engine, addr string) error {
+		addrs = append(addrs, addr)
+		if len(addrs) == 2 {
+			return errors.New("listen failed")
+		}
+		return nil
+	}
+
+	activeConfig.Port = "1234"
+	startServer()
+
+	activeConfig.Port = ""
+	t.Setenv("PORT", "4321")
+	startServer()
+
+	if len(addrs) != 2 || addrs[0] != ":1234" || addrs[1] != ":4321" {
+		t.Fatalf("runRouter addrs = %#v", addrs)
+	}
+}
+
+func TestArtInitRunsMigrations(t *testing.T) {
+	dbInstance := setupMainDB(t)
+	commands := artCommands(Art{})
+	commands["init"]()
+
+	for _, table := range []string{"pages_00", "status_00", "word_postings"} {
+		if !dbInstance.Migrator().HasTable(table) {
+			t.Fatalf("expected Art.Init to create %s", table)
+		}
+	}
+}
+
+func TestArtInitReturnsOnMigrationError(t *testing.T) {
+	originalPagesDB := db.DbInstance0
+	originalDictionaryDB := db.DbInstanceDic
+	t.Cleanup(func() {
+		db.DbInstance0 = originalPagesDB
+		db.DbInstanceDic = originalDictionaryDB
+	})
+
+	dbInstance, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	sqlDB, err := dbInstance.DB()
+	if err != nil {
+		t.Fatalf("sqlite DB handle: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close sqlite: %v", err)
+	}
+	db.DbInstance0 = dbInstance
+	db.DbInstanceDic = dbInstance
+
+	Art{}.Init()
 }
 
 func TestResolveRuntimeRole(t *testing.T) {
@@ -740,8 +927,8 @@ func TestCronHelpers(t *testing.T) {
 	if got := runArtCommand(map[string]artCommand{"noop": func(...string) {}}, []string{"noop"}); !got {
 		t.Fatal("expected noop art command to run")
 	}
-	if !reflect.DeepEqual(splitStringSet(domain1BlackList), splitStringSet(domain1BlackList)) {
-		t.Fatal("unreachable sanity check")
+	if got := splitStringSet(domain1BlackList); len(got) != len(domain1BlackList) {
+		t.Fatalf("splitStringSet len = %d, want %d", len(got), len(domain1BlackList))
 	}
 }
 

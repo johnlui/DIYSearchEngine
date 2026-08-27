@@ -31,3 +31,39 @@ func TestRunCreatesSchemaAndSeeds(t *testing.T) {
 		t.Fatalf("stop flag = %q", stopValue)
 	}
 }
+
+func openClosedSQLite(t *testing.T) *gorm.DB {
+	t.Helper()
+
+	dbInstance, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	sqlDB, err := dbInstance.DB()
+	if err != nil {
+		t.Fatalf("sqlite DB handle: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close sqlite: %v", err)
+	}
+	return dbInstance
+}
+
+func TestMigrationErrorsBubbleUp(t *testing.T) {
+	healthyDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open healthy sqlite: %v", err)
+	}
+	if err := Run(openClosedSQLite(t), healthyDB); err == nil {
+		t.Fatal("expected Run to return shard creation error")
+	}
+	if err := createControlTables(openClosedSQLite(t)); err == nil {
+		t.Fatal("expected createControlTables to return error")
+	}
+	if err := createDictionaryTables(openClosedSQLite(t)); err == nil {
+		t.Fatal("expected createDictionaryTables to return error")
+	}
+	if err := seedControlTables(openClosedSQLite(t)); err == nil {
+		t.Fatal("expected seedControlTables to return error")
+	}
+}

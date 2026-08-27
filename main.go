@@ -59,6 +59,9 @@ var runNextStepOnce = runNextStep
 var loadAppConfig = config.Load
 var runtimeRole = resolveRuntimeRole
 var configureRuntimeServices = configureServices
+var runRouter = func(router *gin.Engine, addr string) error {
+	return router.Run(addr)
+}
 
 func main() {
 	// 处理启动参数
@@ -277,7 +280,9 @@ func startServer() {
 	if port == "" {
 		port = os.Getenv("PORT")
 	}
-	buildRouter().Run(":" + port)
+	if err := runRouter(buildRouter(), ":"+port); err != nil {
+		logging.Errorf("event=start_server port=%q error=%q", port, err)
+	}
 }
 
 func statusHostCrawIsTooMuch(host string) bool {

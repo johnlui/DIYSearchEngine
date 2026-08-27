@@ -42,3 +42,24 @@ func TestCurlMalformedURLCountsTowardRetirement(t *testing.T) {
 		t.Fatalf("countCurlFailure called %d times, want 3", calls)
 	}
 }
+
+func TestSetCurlFailureCounter(t *testing.T) {
+	original := countCurlFailure
+	t.Cleanup(func() {
+		countCurlFailure = original
+	})
+
+	SetCurlFailureCounter(func(models.Status) int {
+		return 4
+	})
+	_, code := Curl(models.Status{Url: "https://example.com/\n"})
+	if code != 4 {
+		t.Fatalf("custom failure code = %d, want 4", code)
+	}
+
+	SetCurlFailureCounter(nil)
+	_, code = Curl(models.Status{Url: "https://example.com/\n"})
+	if code != 2 {
+		t.Fatalf("default failure code = %d, want 2", code)
+	}
+}

@@ -17,6 +17,12 @@ func TestParsePostings(t *testing.T) {
 		postings[0].TermFrequency != 3 || postings[0].DocLength != 100 || postings[0].Positions != "0,4" {
 		t.Fatalf("first posting = %#v", postings[0])
 	}
+	if got := ParsePostings("", "0,1,1,1-"); got != nil {
+		t.Fatalf("empty term postings = %#v", got)
+	}
+	if got := ParsePostings("hello", "0,bad,1,1-0,1,bad,1-0,1,1,bad-"); len(got) != 0 {
+		t.Fatalf("invalid postings = %#v", got)
+	}
 }
 
 func TestAppendAndLoadPostings(t *testing.T) {
@@ -30,6 +36,9 @@ func TestAppendAndLoadPostings(t *testing.T) {
 
 	if err := AppendPostings(dbInstance, "hello", "0,1,3,100,0-"); err != nil {
 		t.Fatalf("append postings: %v", err)
+	}
+	if err := AppendPostings(dbInstance, "hello", "bad"); err != nil {
+		t.Fatalf("append empty postings: %v", err)
 	}
 	if err := AppendPostings(dbInstance, "hello", "0,1,5,120,1-"); err != nil {
 		t.Fatalf("append postings update: %v", err)
@@ -45,6 +54,10 @@ func TestAppendAndLoadPostings(t *testing.T) {
 	if loaded["hello"][0].TermFrequency != 5 || loaded["hello"][0].DocLength != 120 {
 		t.Fatalf("updated posting = %#v", loaded["hello"][0])
 	}
+	empty, err := LoadPostings(dbInstance, nil)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("LoadPostings empty = %#v, %v", empty, err)
+	}
 }
 
 func TestAppendLegacyWordDic(t *testing.T) {
@@ -58,8 +71,17 @@ func TestAppendLegacyWordDic(t *testing.T) {
 	if err := EnsureWordDic(dbInstance, "hello"); err != nil {
 		t.Fatalf("ensure word dic: %v", err)
 	}
+	if err := EnsureWordDic(dbInstance, ""); err != nil {
+		t.Fatalf("ensure empty word dic: %v", err)
+	}
 	if err := AppendLegacyWordDic(dbInstance, "hello", "0,1,1,8,0-"); err != nil {
 		t.Fatalf("append legacy: %v", err)
+	}
+	if err := AppendLegacyWordDic(dbInstance, "", "payload"); err != nil {
+		t.Fatalf("append empty legacy term: %v", err)
+	}
+	if err := AppendLegacyWordDic(dbInstance, "hello", ""); err != nil {
+		t.Fatalf("append empty legacy payload: %v", err)
 	}
 
 	var dic models.WordDic
@@ -68,5 +90,20 @@ func TestAppendLegacyWordDic(t *testing.T) {
 	}
 	if dic.Positions != "0,1,1,8,0-" {
 		t.Fatalf("positions = %q", dic.Positions)
+	}
+}
+
+func TestLoadPostingsWithoutTable(t *testing.T) {
+	dbInstance, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+
+	postings, err := LoadPostings(dbInstance, []string{"hello"})
+	if err != nil {
+		t.Fatalf("LoadPostings without table: %v", err)
+	}
+	if len(postings) != 0 {
+		t.Fatalf("postings without table = %#v", postings)
 	}
 }
