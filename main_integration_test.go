@@ -132,6 +132,7 @@ func TestMainFunction(t *testing.T) {
 	originalInitializeENV := initializeENV
 	originalInitializeJieba := initializeJieba
 	originalInitializeDB := initializeDB
+	originalConfigureRuntimeServices := configureRuntimeServices
 	originalInitializeArtCommands := initializeArtCommands
 	originalLaunchServer := launchServer
 	originalCreateCron := createCron
@@ -145,6 +146,7 @@ func TestMainFunction(t *testing.T) {
 		initializeENV = originalInitializeENV
 		initializeJieba = originalInitializeJieba
 		initializeDB = originalInitializeDB
+		configureRuntimeServices = originalConfigureRuntimeServices
 		initializeArtCommands = originalInitializeArtCommands
 		launchServer = originalLaunchServer
 		createCron = originalCreateCron
@@ -158,10 +160,12 @@ func TestMainFunction(t *testing.T) {
 	var calls atomic.Int32
 	serverLaunched := make(chan struct{})
 	cronStarted := make(chan struct{})
+	dictionaryWashed := make(chan struct{})
 	parseFlags = func() { calls.Add(1) }
 	initializeENV = func() { calls.Add(1) }
 	initializeJieba = func() { calls.Add(1) }
 	initializeDB = func() { calls.Add(1) }
+	configureRuntimeServices = func() { calls.Add(1) }
 	initializeArtCommands = func() { calls.Add(1) }
 	launchServer = func() {
 		calls.Add(1)
@@ -175,7 +179,10 @@ func TestMainFunction(t *testing.T) {
 		calls.Add(1)
 		close(cronStarted)
 	}
-	runDictionaryWash = func() { calls.Add(1) }
+	runDictionaryWash = func() {
+		calls.Add(1)
+		close(dictionaryWashed)
+	}
 	runSpider = func(time.Time) { calls.Add(1) }
 	blockMain = func() { calls.Add(1) }
 	tools.ENV_DEBUG = false
@@ -183,8 +190,78 @@ func TestMainFunction(t *testing.T) {
 	main()
 	<-serverLaunched
 	<-cronStarted
-	if calls.Load() != 11 {
-		t.Fatalf("main call count = %d, want 11", calls.Load())
+	<-dictionaryWashed
+	if calls.Load() != 12 {
+		t.Fatalf("main call count = %d, want 12", calls.Load())
+	}
+}
+
+func TestRunAllRolesStartsSpiderWhenIndexerBlocks(t *testing.T) {
+	originalLaunchServer := launchServer
+	originalCreateCron := createCron
+	originalStartCron := startCron
+	originalRunDictionaryWash := runDictionaryWash
+	originalRunSpider := runSpider
+	originalBlockMain := blockMain
+	originalDebug := tools.ENV_DEBUG
+	defer func() {
+		launchServer = originalLaunchServer
+		createCron = originalCreateCron
+		startCron = originalStartCron
+		runDictionaryWash = originalRunDictionaryWash
+		runSpider = originalRunSpider
+		blockMain = originalBlockMain
+		tools.ENV_DEBUG = originalDebug
+	}()
+
+	indexerStarted := make(chan struct{})
+	releaseIndexer := make(chan struct{})
+	spiderStarted := make(chan struct{})
+
+	launchServer = func() {}
+	createCron = func() *cron.Cron { return cron.New(cron.WithSeconds()) }
+	startCron = func(*cron.Cron) {}
+	runDictionaryWash = func() {
+		close(indexerStarted)
+		<-releaseIndexer
+	}
+	runSpider = func(time.Time) { close(spiderStarted) }
+	blockMain = func() {}
+	tools.ENV_DEBUG = false
+
+	runAllRoles()
+
+	select {
+	case <-indexerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("indexer did not start")
+	}
+	select {
+	case <-spiderStarted:
+	case <-time.After(time.Second):
+		t.Fatal("spider did not start while indexer was blocked")
+	}
+	close(releaseIndexer)
+}
+
+func TestResolveRuntimeRole(t *testing.T) {
+	cases := map[string][]string{
+		"all":       {"ese"},
+		"serve":     {"ese", "serve"},
+		"crawler":   {"ese", "crawler"},
+		"scheduler": {"ese", "scheduler"},
+		"indexer":   {"ese", "indexer"},
+		"all-bad":   {"ese", "unknown"},
+	}
+
+	for name, args := range cases {
+		want := name
+		if name == "all-bad" {
+			want = "all"
+		}
+		if got := resolveRuntimeRole(args); got != want {
+			t.Fatalf("resolveRuntimeRole(%s) = %q, want %q", name, got, want)
+		}
 	}
 }
 
@@ -306,8 +383,8 @@ func TestCollectDiscoveredLinks(t *testing.T) {
 		t.Fatalf("links len = %d, want 1: %#v", len(links), links)
 	}
 	link := links[0]
-	if link.title != "Example" || link.url != "https://sub.example.com/a?q=1" || link.host != "sub.example.com" ||
-		link.domain1 != "example.com" || link.domain2 != "sub.example.com" || link.path != "/a" || link.query != "q=1" {
+	if link.Title != "Example" || link.URL != "https://sub.example.com/a?q=1" || link.Host != "sub.example.com" ||
+		link.Domain1 != "example.com" || link.Domain2 != "sub.example.com" || link.Path != "/a" || link.Query != "q=1" {
 		t.Fatalf("unexpected link: %#v", link)
 	}
 }
@@ -333,7 +410,7 @@ func TestSplitDomains(t *testing.T) {
 func TestRedisBackedCrawlHelpers(t *testing.T) {
 	setupMainRedis(t)
 	now := time.Unix(1700000000, 0)
-	links := []discoveredLink{{url: "https://example.com/a"}, {url: "https://example.com/b"}}
+	links := []discoveredLink{{URL: "https://example.com/a"}, {URL: "https://example.com/b"}}
 
 	cacheKnownStatuses("status_exists", []string{"https://example.com/a"})
 	exists := statusExistenceMap("status_exists", links)
@@ -485,8 +562,8 @@ func TestProcessDiscoveredLinks(t *testing.T) {
 	migrateShardTables(t, dbInstance, shardIndex)
 
 	link := discoveredLink{
-		title: "New Page", url: newURL, scheme: "https", host: "sub.example.com",
-		domain1: "example.com", domain2: "sub.example.com", path: "/path", query: "q=1",
+		Title: "New Page", URL: newURL, Scheme: "https", Host: "sub.example.com",
+		Domain1: "example.com", Domain2: "sub.example.com", Path: "/path", Query: "q=1",
 	}
 	processDiscoveredLinks(status, []discoveredLink{link}, now)
 
@@ -620,6 +697,28 @@ func TestCronHelpers(t *testing.T) {
 		t.Fatalf("need_craw_list len = %d", got)
 	}
 
+	dbInstance.Exec("update `" + statusTableName + "` set craw_done = 1")
+	db.Rdb.FlushDB(db.Ctx)
+	domain1BlackList = nil
+	dbInstance.Table("domain_black_list").Create(map[string]any{"domain": "blocked.example"})
+	filterTableName := tools.HexTableName("status", 3)
+	dbInstance.Table(filterTableName).Create(&[]models.Status{
+		{ID: 1, Url: "https://blocked.example/a", Host: "blocked.example"},
+		{ID: 2, Url: "https://allowed.example/a", Host: "allowed.example"},
+	})
+	prepareStatusesBackground()
+	payloads := db.Rdb.LRange(db.Ctx, "need_craw_list", 0, -1).Val()
+	if len(payloads) != 1 {
+		t.Fatalf("need_craw_list filtered len = %d, want 1: %#v", len(payloads), payloads)
+	}
+	var queued models.Status
+	if err := json.Unmarshal([]byte(payloads[0]), &queued); err != nil {
+		t.Fatalf("unmarshal queued status: %v", err)
+	}
+	if queued.Host != "allowed.example" {
+		t.Fatalf("queued host = %q, want allowed.example", queued.Host)
+	}
+
 	domain1BlackList = map[string]struct{}{"domain.test": {}}
 	dbInstance.Table(tools.HexTableName("pages", 2)).Create(&models.Page{ID: 10, Url: "https://sync.example", Host: "sync.example"})
 	autoParsePagesToStatus()
@@ -643,6 +742,22 @@ func TestCronHelpers(t *testing.T) {
 	}
 	if !reflect.DeepEqual(splitStringSet(domain1BlackList), splitStringSet(domain1BlackList)) {
 		t.Fatal("unreachable sanity check")
+	}
+}
+
+func TestAutoParsePagesToStatusUsesMatchingShardCursor(t *testing.T) {
+	setupMainRedis(t)
+	dbInstance := setupMainDB(t)
+	migrateAllShardTables(t, dbInstance)
+
+	dbInstance.Table(tools.HexTableName("status", 0)).Create(&models.Status{ID: 9999, Url: "https://status-00.example", Host: "status-00.example"})
+	dbInstance.Table(tools.HexTableName("pages", 2)).Create(&models.Page{ID: 10, Url: "https://sync-02.example", Host: "sync-02.example"})
+
+	autoParsePagesToStatus()
+
+	var status models.Status
+	if err := dbInstance.Table(tools.HexTableName("status", 2)).First(&status, 10).Error; err != nil {
+		t.Fatalf("expected pages_02 row to sync into status_02: %v", err)
 	}
 }
 

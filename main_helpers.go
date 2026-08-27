@@ -1,15 +1,14 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v8"
-	"github.com/johnlui/enterprise-search-engine/db"
+	"github.com/johnlui/enterprise-search-engine/internal/logging"
+	"github.com/johnlui/enterprise-search-engine/internal/storage"
 	"github.com/johnlui/enterprise-search-engine/models"
-	"github.com/johnlui/enterprise-search-engine/tools"
 )
 
 type artCommand func(...string)
@@ -40,11 +39,11 @@ func runArtCommand(commands map[string]artCommand, args []string) bool {
 
 func runNextStep(startAt time.Time) (time.Time, bool) {
 	// 判断爬虫开关是否关闭
-	_stop := -1
-	db.DbInstance0.Table("kvstores").Where("k", "stop").Select("v").Find(&_stop)
-	if _stop == -1 {
-		fmt.Println("kvstores数据库连接失败，请检查 gorm-log.txt 日志")
-		os.Exit(0)
+	_stop, err := readKVInt("stop")
+	if err != nil {
+		logging.Errorf("event=read_control_flag flag=stop action=retry error=%q", err)
+		sleep(time.Second * 30)
+		return time.Now(), true
 	}
 	if _stop == 1 {
 		fmt.Println("全局开关关闭，30秒后再检测")
@@ -53,15 +52,7 @@ func runNextStep(startAt time.Time) (time.Time, bool) {
 	}
 
 	// 重载一级域名黑名单
-	domain1BlackList = map[string]struct{}{
-		"huangye88.com": {},
-		"gov.cn":        {},
-	}
-	_domain1BlackList := []string{}
-	db.DbInstance0.Raw("select domain from domain_black_list").Scan(&_domain1BlackList)
-	for _, v := range _domain1BlackList {
-		domain1BlackList[v] = struct{}{}
-	}
+	domain1BlackList = loadCurrentDomainBlacklist()
 
 	statusArr := loadStatusesForCrawling()
 	validCount := len(statusArr)
@@ -73,13 +64,7 @@ func runNextStep(startAt time.Time) (time.Time, bool) {
 		return time.Now(), true
 	}
 
-	chs := make([]chan int, validCount)
-	for k, v := range statusArr {
-		chs[k] = make(chan int)
-		go craw(v, chs[k], k)
-	}
-
-	results := collectCrawlResults(chs)
+	results := runCrawlBatch(statusArr)
 	fmt.Println("跑完一轮", time.Now().Unix()-startAt.Unix(), "秒，有效",
 		results[1], "条，略过",
 		results[0], "条，网络错误",
@@ -90,17 +75,24 @@ func runNextStep(startAt time.Time) (time.Time, bool) {
 	}
 
 	now := time.Now()
-	pipe := db.Rdb.Pipeline()
-	key := tools.MinuteBucketKey("ese_spider_result_in_minute_", now)
-	pipe.IncrBy(db.Ctx, key, int64(results[1]))
-	pipe.Expire(db.Ctx, key, time.Hour)
-
-	key1 := tools.MinuteBucketKey("ese_spider_result_4_in_minute_", now)
-	pipe.IncrBy(db.Ctx, key1, int64(results[4]))
-	pipe.Expire(db.Ctx, key1, time.Hour)
-	_, _ = pipe.Exec(db.Ctx)
+	storage.FromGlobals().RecordCrawlResults(results, now)
 
 	return now, true
+}
+
+func runCrawlBatch(statusArr []models.Status) map[int]int {
+	results := make(map[int]int)
+	var mu sync.Mutex
+
+	runWorkerPool(len(statusArr), 爬取Worker数, func(i int) int {
+		code := crawlStatus(statusArr[i], i)
+		mu.Lock()
+		results[code]++
+		mu.Unlock()
+		return 0
+	})
+
+	return results
 }
 
 func loadStatusesForCrawling() []models.Status {
@@ -110,29 +102,7 @@ func loadStatusesForCrawling() []models.Status {
 	}
 
 	popCount := 256 * maxNumber
-	statusArr := make([]models.Status, 0, popCount)
-
-	pipe := db.Rdb.Pipeline()
-	cmds := make([]*redis.StringCmd, popCount)
-	for i := 0; i < popCount; i++ {
-		cmds[i] = pipe.RPop(db.Ctx, "need_craw_list")
-	}
-	_, _ = pipe.Exec(db.Ctx)
-
-	for _, cmd := range cmds {
-		jsonString, err := cmd.Result()
-		if err != nil {
-			continue
-		}
-
-		var status models.Status
-		if err := json.Unmarshal([]byte(jsonString), &status); err != nil {
-			continue
-		}
-		statusArr = append(statusArr, status)
-	}
-
-	return statusArr
+	return storage.FromGlobals().PopCrawlStatuses(popCount)
 }
 
 func collectCrawlResults(chs []chan int) map[int]int {
@@ -141,4 +111,19 @@ func collectCrawlResults(chs []chan int) map[int]int {
 		results[<-ch]++
 	}
 	return results
+}
+
+func readKVInt(key string) (int, error) {
+	return storage.FromGlobals().ReadKVInt(key)
+}
+
+func loadCurrentDomainBlacklist() map[string]struct{} {
+	return storage.FromGlobals().LoadDomainBlacklist(defaultDomainBlacklist())
+}
+
+func defaultDomainBlacklist() map[string]struct{} {
+	return map[string]struct{}{
+		"huangye88.com": {},
+		"gov.cn":        {},
+	}
 }

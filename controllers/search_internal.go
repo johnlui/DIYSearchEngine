@@ -2,16 +2,14 @@ package controllers
 
 import (
 	"container/heap"
-	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/johnlui/enterprise-search-engine/db"
+	"github.com/johnlui/enterprise-search-engine/internal/storage"
 	"github.com/johnlui/enterprise-search-engine/models"
-	"github.com/johnlui/enterprise-search-engine/tools"
 )
 
 const documentCountCacheTTL = time.Minute
@@ -66,9 +64,7 @@ func estimatedDocumentCount(now time.Time) int {
 	}
 	documentCountCache.mu.RUnlock()
 
-	var count int
-	db.DbInstance0.Raw("select count(*) from pages_70 where dic_done = 1").Scan(&count)
-	count *= 256
+	count := storage.FromGlobals().EstimatedIndexedDocumentCount()
 
 	documentCountCache.mu.Lock()
 	documentCountCache.value = count
@@ -83,15 +79,66 @@ func loadWordDics(words []string) map[string]models.WordDic {
 		return map[string]models.WordDic{}
 	}
 
-	dics := make([]models.WordDic, 0, len(words))
-	db.DbInstanceDic.Where("name IN ?", words).Find(&dics)
+	return storage.FromGlobals().LoadWordDics(words)
+}
 
-	result := make(map[string]models.WordDic, len(dics))
-	for _, dic := range dics {
-		result[dic.Name] = dic
+func loadDocPartsByWord(words []string) map[string][]docPart {
+	result := make(map[string][]docPart, len(words))
+	if len(words) == 0 {
+		return result
+	}
+
+	postingsByWord := storage.FromGlobals().LoadPostings(words)
+	for word, postings := range postingsByWord {
+		result[word] = docPartsFromPostings(postings)
+	}
+
+	for word, dic := range loadWordDics(words) {
+		result[word] = mergeDocParts(result[word], parseBestDocParts(dic.Positions))
 	}
 
 	return result
+}
+
+func docPartsFromPostings(postings []models.WordPosting) []docPart {
+	parts := make([]docPart, 0, len(postings))
+	for _, posting := range postings {
+		docKey := strconv.Itoa(posting.TableIndex) + "-" + strconv.Itoa(int(posting.DocID))
+		parts = append(parts, docPart{
+			docKey:        docKey,
+			tableIndex:    posting.TableIndex,
+			docID:         posting.DocID,
+			termFrequency: posting.TermFrequency,
+			docLength:     posting.DocLength,
+		})
+	}
+	return parts
+}
+
+func mergeDocParts(primary, fallback []docPart) []docPart {
+	if len(primary) == 0 {
+		return fallback
+	}
+	if len(fallback) == 0 {
+		return primary
+	}
+
+	seen := make(map[string]struct{}, len(primary))
+	merged := make([]docPart, 0, len(primary)+len(fallback))
+	for _, part := range primary {
+		seen[part.docKey] = struct{}{}
+		merged = append(merged, part)
+	}
+
+	for _, part := range fallback {
+		if _, ok := seen[part.docKey]; ok {
+			continue
+		}
+		seen[part.docKey] = struct{}{}
+		merged = append(merged, part)
+	}
+
+	return merged
 }
 
 func uniqueStrings(values []string) []string {
@@ -210,19 +257,7 @@ func loadPagesByDocKey(keys []string) map[string]models.Page {
 		idsByTable[tableIndex] = append(idsByTable[tableIndex], docID)
 	}
 
-	pagesByDocKey := make(map[string]models.Page, len(keys))
-	for tableIndex, ids := range idsByTable {
-		tableName := tools.HexTableName("pages", tableIndex)
-		var pages []models.Page
-		db.DbInstance0.Table(tableName).Where("id IN ?", ids).Find(&pages)
-
-		for _, page := range pages {
-			docKey := fmt.Sprintf("%d-%d", tableIndex, page.ID)
-			pagesByDocKey[docKey] = page
-		}
-	}
-
-	return pagesByDocKey
+	return storage.FromGlobals().LoadPagesByTableIDs(idsByTable)
 }
 
 func parseDocKey(value string) (int, uint, bool) {

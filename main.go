@@ -10,8 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/johnlui/enterprise-search-engine/config"
 	"github.com/johnlui/enterprise-search-engine/controllers"
 	"github.com/johnlui/enterprise-search-engine/db"
+	"github.com/johnlui/enterprise-search-engine/internal/logging"
+	"github.com/johnlui/enterprise-search-engine/internal/storage"
 	"github.com/johnlui/enterprise-search-engine/models"
 	"github.com/johnlui/enterprise-search-engine/tools"
 
@@ -25,11 +28,14 @@ var domain1BlackList map[string]struct{}
 var wordBlackList map[string]struct{}
 
 var 一次爬取 = 4
+var 爬取Worker数 = 64
 var 一次准备 = 20
 
 var 每分钟每个表执行分词 = 2
 var 一步转移的字典条数 = 2000
 var 每个词转移的深度 int64 = 10000
+
+var activeConfig config.Config
 
 var parseFlags = flag.Parse
 var initializeENV = initENV
@@ -50,10 +56,14 @@ var blockMain = func() { select {} }
 var artCommandFactory = artCommands
 var debugDump = tools.DD
 var runNextStepOnce = runNextStep
+var loadAppConfig = config.Load
+var runtimeRole = resolveRuntimeRole
+var configureRuntimeServices = configureServices
 
 func main() {
 	// 处理启动参数
 	parseFlags()
+	role := runtimeRole(os.Args)
 
 	// 加载 .env
 	initializeENV()
@@ -63,30 +73,42 @@ func main() {
 
 	// 初始化数据库
 	initializeDB()
+	configureRuntimeServices()
 
 	// Art 命令行工具
 	initializeArtCommands()
 
+	runRole(role)
+}
+
+func runRole(role string) {
+	switch role {
+	case "serve":
+		launchServer()
+	case "crawler":
+		runSpider(time.Now())
+	case "scheduler":
+		startScheduler()
+		blockMain()
+	case "indexer":
+		runDictionaryWash()
+	case "all":
+		runAllRoles()
+	default:
+		fmt.Println("未知运行角色:", role)
+		fmt.Println("可用角色: all, serve, crawler, scheduler, indexer")
+	}
+}
+
+func runAllRoles() {
 	// 启动 web 页面
 	go launchServer()
 
-	// 定时任务
-	c := createCron()
-	// 自动从 pages 复制数据到 status
-	c.AddFunc("*/20 * * * * *", autoParsePagesToStatus)
-	// 将可以爬的 URL 插入 Redis
-	c.AddFunc("*/20 * * * * *", prepareStatusesBackground)
-	// 五分钟刷新一次每个 host 的页面数量
-	c.AddFunc("0 */5 * * * *", refreshHostCount)
-	// 分词，生成字典数据，并将数据插入 Redis
-	c.AddFunc("25 * * * * *", washHTMLToDB10)
-	// 字典从 Redis 批量插入 MySQL
-	c.AddFunc("*/6 * * * * *", washDB10ToDicMySQL)
-	go startCron(c)
+	startScheduler()
 
 	// 生产环境专用
 	if !tools.ENV_DEBUG {
-		runDictionaryWash()
+		go runDictionaryWash()
 	}
 	/*
 	   spider
@@ -98,6 +120,31 @@ func main() {
 	blockMain()
 }
 
+func startScheduler() {
+	c := createCron()
+	registerSchedulerJobs(c)
+	go startCron(c)
+}
+
+func registerSchedulerJobs(c *cron.Cron) {
+	// 自动从 pages 复制数据到 status
+	mustAddCronFunc(c, "*/20 * * * * *", autoParsePagesToStatus)
+	// 将可以爬的 URL 插入 Redis
+	mustAddCronFunc(c, "*/20 * * * * *", prepareStatusesBackground)
+	// 五分钟刷新一次每个 host 的页面数量
+	mustAddCronFunc(c, "0 */5 * * * *", refreshHostCount)
+	// 分词，生成字典数据，并将数据插入 Redis
+	mustAddCronFunc(c, "25 * * * * *", washHTMLToDB10)
+	// 字典从 Redis 批量插入 MySQL
+	mustAddCronFunc(c, "*/6 * * * * *", washDB10ToDicMySQL)
+}
+
+func mustAddCronFunc(c *cron.Cron, spec string, cmd func()) {
+	if _, err := c.AddFunc(spec, cmd); err != nil {
+		log.Fatalf("register cron %q: %v", spec, err)
+	}
+}
+
 func initENV() {
 	path, _ := os.Getwd()
 	err := godotenv.Load(path + "/.env")
@@ -105,8 +152,39 @@ func initENV() {
 	if err != nil {
 		log.Fatal("Error loading .env file")
 	}
-	tools.ENV_DEBUG = os.Getenv("APP_DEBUG") == "true"
-	fmt.Println("APP_ENV:", os.Getenv("APP_ENV"))
+	activeConfig = loadAppConfig()
+	applyRuntimeConfig(activeConfig)
+	fmt.Println("APP_ENV:", activeConfig.AppEnv)
+}
+
+func applyRuntimeConfig(cfg config.Config) {
+	tools.ENV_DEBUG = cfg.AppDebug
+	一次爬取 = cfg.CrawlBatch
+	爬取Worker数 = cfg.CrawlWorkers
+	一次准备 = cfg.PrepareBatch
+	每分钟每个表执行分词 = cfg.IndexPagesPerShard
+	一步转移的字典条数 = cfg.IndexTransferBatch
+	每个词转移的深度 = cfg.IndexTransferWordDepth
+}
+
+func configureServices() {
+	tools.SetCurlFailureCounter(countCurlFailureWithRedis)
+}
+
+func countCurlFailureWithRedis(status models.Status) int {
+	return storage.FromGlobals().CountCrawlFailure(status.Url)
+}
+
+func resolveRuntimeRole(args []string) string {
+	if len(args) < 2 {
+		return "all"
+	}
+	switch args[1] {
+	case "all", "serve", "crawler", "scheduler", "indexer":
+		return args[1]
+	default:
+		return "all"
+	}
 }
 func initArtCommands() {
 	argsWithProg := os.Args[1:]
@@ -139,47 +217,37 @@ func nextStep(t time.Time) {
 
 // 真的爬，存储标题，内容，以及子链接
 func craw(status models.Status, ch chan int, index int) {
+	ch <- crawlStatus(status, index)
+}
+
+func crawlStatus(status models.Status, index int) int {
 	now := time.Now()
 
 	// 检查是否过于频繁
 	if statusHostCrawIsTooMuch(status.Host) {
-		ch <- 0
 		// fmt.Println("过于频繁", time.Now().UnixMilli()-t.UnixMilli(), "毫秒")
-		return
+		return 0
 	}
-	doc, chVal := tools.Curl(status)
+	doc, chVal := tools.CurlContext(db.Ctx, status)
 
 	// 如果失败，则不进行任何操作
 	if chVal != 1 && chVal != 4 {
-		ch <- chVal
-
 		// fmt.Println("curl失败", time.Now().UnixMilli()-t.UnixMilli(), "毫秒")
-		return
+		return chVal
 	}
 
-	// 更新 Status
-	status.CrawDone = 1
 	status.CrawTime = now
-	realDB(status.Url).Scopes(statusTable(status.Url)).Save(&status)
-
-	// 更新 Lake
-	var lake models.Page
-	realDB(status.Url).Scopes(lakeTable(status.Url)).Where(models.Page{ID: status.ID}).FirstOrCreate(&lake)
-
-	lake.Url = status.Url
-	lake.Host = status.Host
-	lake.CrawDone = status.CrawDone
-	lake.CrawTime = status.CrawTime
-	lake.Title = tools.StringStrip(strings.TrimSpace(doc.Find("title").Text()))
-	lake.Text = tools.StringStrip(strings.TrimSpace(doc.Text()))
-	realDB(status.Url).Scopes(lakeTable(status.Url)).Save(&lake)
+	title := tools.StringStrip(strings.TrimSpace(doc.Find("title").Text()))
+	text := tools.StringStrip(strings.TrimSpace(doc.Text()))
+	if err := storage.FromGlobals().SaveCrawledPage(status, title, text); err != nil {
+		logging.Errorf("event=save_crawled_page url=%q error=%q", status.Url, err)
+		return chVal
+	}
 
 	// 开始处理页面上新的超链接
-	_stopNew := -1
-	db.DbInstance0.Table("kvstores").Where("k", "stopNew").Select("v").Find(&_stopNew)
-	if _stopNew == -1 {
-		fmt.Println("kvstores数据库连接失败，请检查 gorm-log.txt 日志")
-		os.Exit(0)
+	_stopNew, err := readKVInt("stopNew")
+	if err != nil {
+		logging.Errorf("event=read_control_flag flag=stopNew action=skip_discovery error=%q", err)
 	} else if _stopNew == 1 {
 		// fmt.Println("新URL全局开关关闭")
 	} else {
@@ -189,9 +257,8 @@ func craw(status models.Status, ch chan int, index int) {
 	// 写入 Redis，用于主动限流
 	incrementHostCrawlWindows(status.Host, now)
 
-	ch <- chVal
-
 	// fmt.Println("正常结束", time.Now().UnixMilli()-t.UnixMilli(), "毫秒")
+	return chVal
 }
 
 func buildRouter() *gin.Engine {
@@ -206,57 +273,40 @@ func buildRouter() *gin.Engine {
 }
 
 func startServer() {
-	buildRouter().Run(":" + os.Getenv("PORT"))
+	port := activeConfig.Port
+	if port == "" {
+		port = os.Getenv("PORT")
+	}
+	buildRouter().Run(":" + port)
 }
 
 func statusHostCrawIsTooMuch(host string) bool {
-	hostBlackList, err := db.Rdb.SIsMember(db.Ctx, "ese_spider_host_black_list", host).Result()
-	if err == nil && hostBlackList {
-		return true
-	}
+	return storage.FromGlobals().HostCrawlIsLimited(host, storageCrawlRateWindows(), time.Now())
+}
 
-	now := time.Now()
-	pipe := db.Rdb.Pipeline()
-	countCmds := make([]func() (int, error), len(crawlRateWindows))
-	for i, window := range crawlRateWindows {
-		cmd := pipe.Get(db.Ctx, tools.WindowBucketKey("ese_spider_xianliu_", host, window.seconds, now))
-		countCmds[i] = cmd.Int
+func storageCrawlRateWindows() []storage.CrawlRateWindow {
+	windows := make([]storage.CrawlRateWindow, 0, len(crawlRateWindows))
+	for _, window := range crawlRateWindows {
+		windows = append(windows, storage.CrawlRateWindow{
+			Seconds: window.seconds,
+			Limit:   window.limit,
+		})
 	}
-	_, _ = pipe.Exec(db.Ctx)
-
-	for i, getCount := range countCmds {
-		count, err := getCount()
-		if err == nil && count >= crawlRateWindows[i].limit {
-			addHostToBlacklist(host)
-			return true
-		}
-	}
-	return false
+	return windows
 }
 
 func realDB(url string) *gorm.DB {
-	// i, _ := strconv.ParseInt(tools.GetMD5Hash(url)[0:2], 16, 64)
-
-	realDB := db.DbInstance0
-
-	// 如果你有多个数据库，可以取消注释
-	// if i > 127 {
-	//   realDB = db.DbInstance1
-	// }
-
-	return realDB
+	return storage.FromGlobals().DBForURL(url)
 }
 
 func statusTable(url string) func(tx *gorm.DB) *gorm.DB {
-	return md5Table(url, "status")
+	return storage.FromGlobals().StatusScope(url)
 }
 func lakeTable(url string) func(tx *gorm.DB) *gorm.DB {
-	return md5Table(url, "pages")
+	return storage.FromGlobals().PageScope(url)
 }
 func md5Table(url string, table string) func(tx *gorm.DB) *gorm.DB {
-	return func(tx *gorm.DB) *gorm.DB {
-		return tx.Table(tools.MD5TableName(table, url))
-	}
+	return storage.FromGlobals().TableScope(table, url)
 }
 
 func dd(v ...any) {

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -10,9 +9,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/go-redis/redis/v8"
-	"github.com/johnlui/enterprise-search-engine/db"
-	"github.com/johnlui/enterprise-search-engine/models"
+	"github.com/johnlui/enterprise-search-engine/internal/logging"
+	"github.com/johnlui/enterprise-search-engine/internal/storage"
 	"github.com/johnlui/enterprise-search-engine/tools"
 	"golang.org/x/text/width"
 	"gorm.io/gorm"
@@ -26,15 +24,13 @@ func autoParsePagesToStatus() {
 
 	var count int64 = 0
 
-	realDB := db.DbInstance0
-
 	for i := 0; i < 256; i++ {
-		pagesTableName := tools.HexTableName("pages", i)
-		statusTableName := tools.HexTableName("status", i)
-
-		result := realDB.Exec("insert into `" + statusTableName + "` select `id`, `url`, `host`, `craw_done`, `craw_time` from `" + pagesTableName + "` where id > COALESCE((select max(id) from status_00), 0);")
-
-		count += result.RowsAffected
+		rowsAffected, err := storage.FromGlobals().SyncPagesToStatus(i)
+		if err != nil {
+			logging.Errorf("event=sync_pages_to_status shard=%d error=%q", i, err)
+			continue
+		}
+		count += rowsAffected
 	}
 	if count > 0 {
 		fmt.Println("从 pages 同步了一批数据到 status", currentTime().Unix()-t.Unix(), "秒，共", count, "条")
@@ -51,14 +47,8 @@ func prepareStatusesBackground() {
 	}
 
 	// host 黑名单，用于提升过滤效率
-	hostBlackListInOneStepArray, _ := db.Rdb.SMembers(db.Ctx, "ese_spider_host_black_list").Result()
-	if len(hostBlackListInOneStepArray) == 0 {
-		db.Rdb.SAdd(db.Ctx, "ese_spider_host_black_list", "ooxx")
-		db.Rdb.Expire(db.Ctx, "ese_spider_host_black_list", time.Minute*42).Err()
-		for k := range domain1BlackList {
-			hostBlackListInOneStepArray = append(hostBlackListInOneStepArray, k)
-		}
-	}
+	domain1BlackList = loadCurrentDomainBlacklist()
+	hostBlackListInOneStepArray := storage.FromGlobals().LoadHostBlacklist(domain1BlackList)
 
 	count := runWorkerPool(256, 8, func(i int) int {
 		return enqueueStatusesForTable(i, maxNumber, hostBlackListInOneStepArray)
@@ -83,49 +73,10 @@ func refreshHostCount() {
 		return
 	}
 
-	// 总数
 	for i := start; i < end; i++ {
-		tableName := tools.HexTableName("status", i)
-
-		realDB := db.DbInstance0
-		_hostCountArr := []models.HostCount{}
-		realDB.Raw("select host, count(*) count from " + tableName + " where host is not null group by host having count > 500").Scan(&_hostCountArr)
-
-		key := "host_counts_all_" + strconv.Itoa(int(currentTime().Unix())/86400)
-		for _, v := range _hostCountArr {
-			db.Rdb.HIncrBy(db.Ctx, key, v.Host, int64(v.Count))
+		if err := storage.FromGlobals().RefreshHostCountsForShard(i, currentTime()); err != nil {
+			logging.Errorf("event=refresh_host_counts shard=%d error=%q", i, err)
 		}
-		db.Rdb.Expire(db.Ctx, key, time.Hour*48).Err()
-	}
-
-	// 已爬数量
-	for i := start; i < end; i++ {
-		tableName := tools.HexTableName("status", i)
-
-		realDB := db.DbInstance0
-		_hostCountArr := []models.HostCount{}
-		realDB.Raw("select host, count(*) crawd_count from " + tableName + " where craw_done = 1 and host is not null group by host").Scan(&_hostCountArr)
-
-		key := "host_counts_crawd_" + strconv.Itoa(int(currentTime().Unix())/86400)
-		for _, v := range _hostCountArr {
-			db.Rdb.HIncrBy(db.Ctx, key, v.Host, int64(v.CrawdCount))
-		}
-		db.Rdb.Expire(db.Ctx, key, time.Hour*48).Err()
-	}
-
-	// 已爬但无效的数量
-	for i := start; i < end; i++ {
-		tableName := tools.HexTableName("pages", i)
-
-		realDB := db.DbInstance0
-		_hostCountArr := []models.HostCount{}
-		realDB.Raw("select host, count(*) crawd_count from " + tableName + " where craw_done = 1 and text = '' and host is not null group by host").Scan(&_hostCountArr)
-
-		key := "host_counts_crawd_invalid_" + strconv.Itoa(int(currentTime().Unix())/86400)
-		for _, v := range _hostCountArr {
-			db.Rdb.HIncrBy(db.Ctx, key, v.Host, int64(v.CrawdCount))
-		}
-		db.Rdb.Expire(db.Ctx, key, time.Hour*48).Err()
 	}
 
 	fmt.Println("刷新URL数完成：start", start, "end", end, currentTime().Unix()-t.Unix(), "秒")
@@ -135,7 +86,7 @@ func refreshHostCount() {
 func washHTMLToDB10() {
 	t := currentTime()
 	total := runWorkerPool(256, 16, func(i int) int {
-		return generateDicsForTable(i, db.DbInstance0, tools.HexTableName("pages", i))
+		return generateDicsForTableWithStore(i, storage.FromGlobals(), tools.HexTableName("pages", i))
 	})
 
 	if total > 0 {
@@ -153,11 +104,11 @@ type WordAndSppendSrting struct {
 // 将 redis 里的分词结果洗到数据库里
 func washDB10ToDicMySQL() {
 	for {
-		_stop := -1
-		db.DbInstance0.Table("kvstores").Where("k", "stopWashDicRedisToMySQL").Select("v").Find(&_stop)
-		if _stop == -1 {
-			fmt.Println("kvstores数据库连接失败，请检查 gorm-log.txt 日志")
-			os.Exit(0)
+		_stop, err := readKVInt("stopWashDicRedisToMySQL")
+		if err != nil {
+			logging.Errorf("event=read_control_flag flag=stopWashDicRedisToMySQL action=retry error=%q", err)
+			sleep(time.Second * 60)
+			continue
 		}
 		if _stop == 1 {
 			fmt.Println("全局开关关闭，60秒后再检测")
@@ -199,13 +150,9 @@ func transferWordDicsBatch() bool {
 	})
 
 	fmt.Println("开始插入数据库")
-	db.DbInstanceDic.Transaction(func(tx *gorm.DB) error {
-		for w, s := range needUpdate {
-			tx.Exec(`UPDATE word_dics
-      SET positions = concat(ifnull(positions,''), ?) where name = ?`, s, w)
-		}
-		return nil
-	})
+	if err := storage.FromGlobals().SaveWordAppends(needUpdate); err != nil {
+		dd(err)
+	}
 
 	if len(needUpdate) > 0 {
 		fmt.Println("转移完一批字典，共", len(needUpdate), "条，启动时间", t.Format("2006-01-02 15:04:05"))
@@ -217,60 +164,20 @@ func transferWordDicsBatch() bool {
 func getWordAndSppendSrting() WordAndSppendSrting {
 	wordAndSppendSrting := WordAndSppendSrting{}
 
-	word := db.Rdb10.RandomKey(db.Ctx).Val()
-	if word == "" {
-		return wordAndSppendSrting
-	}
-
-	listLength := db.Rdb10.LLen(db.Ctx, word).Val()
-	if listLength <= 0 {
-		return wordAndSppendSrting
-	}
-
-	if !db.Rdb.HExists(db.Ctx, "HasBeenTransported", word).Val() {
-		db.DbInstanceDic.Exec(`INSERT IGNORE INTO word_dics
-                        SET name = ?,
-                        positions = ''`, word)
-	}
-	db.Rdb.HSet(db.Ctx, "HasBeenTransported", word, "")
-
-	limit := listLength
-	if limit > 每个词转移的深度 {
-		limit = 每个词转移的深度
-	}
-
-	var valuesCmd *redis.StringSliceCmd
-	_, _ = db.Rdb10.TxPipelined(db.Ctx, func(pipe redis.Pipeliner) error {
-		valuesCmd = pipe.LRange(db.Ctx, word, 0, limit-1)
-		pipe.LTrim(db.Ctx, word, limit, -1)
-		return nil
-	})
-
-	values, err := valuesCmd.Result()
-	if err != nil || len(values) == 0 {
-		return wordAndSppendSrting
-	}
-
-	var builder strings.Builder
-	for _, value := range values {
-		builder.WriteString(value)
-	}
-
-	wordAndSppendSrting.word = word
-	wordAndSppendSrting.appendString = builder.String()
+	append := storage.FromGlobals().PopWordAppend(每个词转移的深度)
+	wordAndSppendSrting.word = append.Word
+	wordAndSppendSrting.appendString = append.Payload
 	return wordAndSppendSrting
 }
 
 func generateDicsForTable(i int, realDB *gorm.DB, tableName string) int {
-	var lakes []models.Page
-	realDB.Table(tableName).
-		Where("dic_done = 0").
-		Where("craw_done = 1").
-		Order("id asc").
-		Limit(每分钟每个表执行分词).
-		Scan(&lakes)
-	// tools.DD(lakes[0].Text)
+	store := storage.FromGlobals()
+	store.PagesDB = realDB
+	return generateDicsForTableWithStore(i, store, tableName)
+}
 
+func generateDicsForTableWithStore(i int, store storage.Handles, tableName string) int {
+	lakes := store.LoadPagesForIndex(tableName, 每分钟每个表执行分词)
 	/*
 	   1. 分词，然后对分词结果进行重整：
 	   2. 统计词频
@@ -322,12 +229,11 @@ func generateDicsForTable(i int, realDB *gorm.DB, tableName string) int {
 				strings.Join(v.positions, ",") +
 				"-"
 
-			db.Rdb10.RPush(db.Ctx, w, appendSrting)
+			store.PushIndexAppend(w, appendSrting)
 
 		}
 
-		lake.DicDone = 1
-		realDB.Table(tableName).Save(&lake)
+		store.MarkPageIndexed(tableName, lake)
 	}
 
 	return len(lakes)
@@ -339,48 +245,9 @@ type WordResult struct {
 }
 
 func enqueueStatusesForTable(i, maxNumber int, hostBlackListInOneStepArray []string) int {
-	tableName := tools.HexTableName("status", i)
-
-	var statusArray []models.Status
-	key := "table_" + tableName + "_max_into_queue_id"
-	maxID, _ := db.Rdb.Get(db.Ctx, key).Int()
-	db.DbInstance0.Table(tableName).
-		Where("craw_done", 0).
-		Where("host not in (?)", hostBlackListInOneStepArray).
-		Where("id > ?", maxID).
-		Order("id").Limit(maxNumber).Find(&statusArray)
-
-	if len(statusArray) == 0 {
-		return 0
-	}
-
-	taskBytes := make([]any, 0, len(statusArray))
-	for _, status := range statusArray {
-		payload, _ := json.Marshal(status)
-		taskBytes = append(taskBytes, payload)
-	}
-	if err := db.Rdb.LPush(db.Ctx, "need_craw_list", taskBytes...).Err(); err != nil {
-		dd(err)
-	}
-
-	keyTTL, _ := db.Rdb.TTL(db.Ctx, key).Result()
-	if keyTTL == -1 {
-		keyTTL = time.Hour
-	}
-
-	if err := db.Rdb.Set(db.Ctx, key, statusArray[len(statusArray)-1].ID, keyTTL).Err(); err != nil {
-		dd(err)
-	}
-
-	return len(statusArray)
+	return storage.FromGlobals().EnqueueStatusesForTable(i, maxNumber, hostBlackListInOneStepArray)
 }
 
 func reloadWordBlacklist() {
-	words := []string{}
-	db.DbInstance0.Raw("select word from word_black_list").Scan(&words)
-
-	wordBlackList = make(map[string]struct{}, len(words))
-	for _, word := range words {
-		wordBlackList[word] = struct{}{}
-	}
+	wordBlackList = storage.FromGlobals().LoadWordBlacklist()
 }

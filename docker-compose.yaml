@@ -1,45 +1,72 @@
-version: '3.8'
+version: "3.8"
+
+x-ese-common: &ese-common
+  build:
+    context: .
+  depends_on:
+    - mysql
+    - redis
+  environment:
+    APP_ENV: production
+    APP_DEBUG: "false"
+    PORT: "8080"
+    DB_HOST0: mysql
+    DB_PORT0: "3306"
+    DB_DATABASE0: ese_pages
+    DB_USERNAME0: root
+    DB_PASSWORD0: your_root_password
+    DB_HOST_DIC: mysql
+    DB_PORT_DIC: "3306"
+    DB_DATABASE_DIC: ese_pages
+    DB_USERNAME_DIC: root
+    DB_PASSWORD_DIC: your_root_password
+    REDIS_HOST: redis
+    REDIS_PORT: ":6379"
+    REDIS_PASSWORD: ""
+    CRAWL_BATCH: "4"
+    CRAWL_WORKERS: "64"
+    PREPARE_BATCH: "20"
+    INDEX_PAGES_PER_SHARD: "2"
+    INDEX_TRANSFER_BATCH: "2000"
+    INDEX_TRANSFER_WORD_DEPTH: "10000"
 
 services:
-  # MySQL 服务配置
   mysql:
-    image: mysql:latest
+    image: mysql:8.4
     restart: always
     ports:
       - "3306:3306"
     environment:
       MYSQL_ROOT_PASSWORD: your_root_password
-      MYSQL_DATABASE: your_database_name
+      MYSQL_DATABASE: ese_pages
     volumes:
       - mysql_data:/var/lib/mysql
 
-  # Redis 服务配置
   redis:
-    image: redis:latest
+    image: redis:7.2
     restart: always
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
 
-  # 项目服务配置
-  ese:
-    build:
-      context: .
+  ese-server:
+    <<: *ese-common
+    command: ["./ese", "serve"]
     ports:
       - "8080:8080"
-    depends_on:
-      - mysql
-      - redis
-    environment:
-      MYSQL_HOST: mysql
-      MYSQL_PORT: "3306"
-      MYSQL_USER: root
-      MYSQL_PASSWORD: your_root_password
-      MYSQL_DBNAME: your_database_name
-      REDIS_ADDR: redis:6379
-    volumes:
-      - .:/app
+
+  ese-scheduler:
+    <<: *ese-common
+    command: ["./ese", "scheduler"]
+
+  ese-crawler:
+    <<: *ese-common
+    command: ["./ese", "crawler"]
+
+  ese-indexer:
+    <<: *ese-common
+    command: ["./ese", "indexer"]
 
 volumes:
   mysql_data:

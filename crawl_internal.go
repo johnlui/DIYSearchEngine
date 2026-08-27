@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/go-redis/redis/v8"
-	"github.com/johnlui/enterprise-search-engine/db"
+	"github.com/johnlui/enterprise-search-engine/internal/keys"
+	"github.com/johnlui/enterprise-search-engine/internal/storage"
 	"github.com/johnlui/enterprise-search-engine/models"
 	"github.com/johnlui/enterprise-search-engine/tools"
 	"golang.org/x/text/width"
@@ -19,16 +19,7 @@ type crawlRateWindow struct {
 	limit   int
 }
 
-type discoveredLink struct {
-	title   string
-	url     string
-	scheme  string
-	host    string
-	domain1 string
-	domain2 string
-	path    string
-	query   string
-}
+type discoveredLink = storage.DiscoveredLink
 
 var crawlRateWindows = []crawlRateWindow{
 	{seconds: 2, limit: 1},
@@ -73,14 +64,14 @@ func collectDiscoveredLinks(doc *goquery.Document) []discoveredLink {
 		}
 
 		links = append(links, discoveredLink{
-			title:   title,
-			url:     normalizedURL,
-			scheme:  strings.ToLower(parsedURL.Scheme),
-			host:    host,
-			domain1: strings.ToLower(domain1),
-			domain2: strings.ToLower(domain2),
-			path:    parsedURL.Path,
-			query:   parsedURL.RawQuery,
+			Title:   title,
+			URL:     normalizedURL,
+			Scheme:  strings.ToLower(parsedURL.Scheme),
+			Host:    host,
+			Domain1: strings.ToLower(domain1),
+			Domain2: strings.ToLower(domain2),
+			Path:    parsedURL.Path,
+			Query:   parsedURL.RawQuery,
 		})
 	})
 
@@ -92,48 +83,27 @@ func processDiscoveredLinks(status models.Status, links []discoveredLink, now ti
 		return
 	}
 
-	const statusHashMapKey = "ese_spider_status_exist"
-	statusExists := statusExistenceMap(statusHashMapKey, links)
+	store := storage.FromGlobals()
+	statusExists := statusExistenceMap(keys.SpiderKnownStatuses, links)
 	urlsToCache := make([]string, 0, len(links))
 	newStatusCount := 0
 
 	for _, link := range links {
-		if statusExists[link.url] {
+		if statusExists[link.URL] {
 			continue
 		}
 
-		var newStatus models.Status
-		result := realDB(link.url).Scopes(statusTable(link.url)).Where(models.Status{Url: link.url}).FirstOrCreate(&newStatus)
-
-		newStatus.Url = link.url
-		newStatus.Host = link.host
-		newStatus.CrawTime = pendingCrawTime
-		realDB(link.url).Scopes(statusTable(link.url)).Save(&newStatus)
-
-		if result.RowsAffected > 0 {
+		created, err := store.SaveDiscoveredLink(status, link, pendingCrawTime)
+		if err != nil {
+			continue
+		}
+		if created {
 			newStatusCount++
 		}
-
-		var newLake models.Page
-		realDB(link.url).Scopes(lakeTable(link.url)).Where(models.Page{ID: newStatus.ID}).FirstOrCreate(&newLake)
-
-		newLake.ID = newStatus.ID
-		newLake.OriginTitle = link.title
-		newLake.ReferrerId = status.ID
-		newLake.Url = link.url
-		newLake.Scheme = link.scheme
-		newLake.Host = link.host
-		newLake.Domain1 = link.domain1
-		newLake.Domain2 = link.domain2
-		newLake.Path = link.path
-		newLake.Query = link.query
-		newLake.CrawTime = pendingCrawTime
-		realDB(link.url).Scopes(lakeTable(link.url)).Save(&newLake)
-
-		urlsToCache = append(urlsToCache, link.url)
+		urlsToCache = append(urlsToCache, link.URL)
 	}
 
-	cacheKnownStatuses(statusHashMapKey, urlsToCache)
+	cacheKnownStatuses(keys.SpiderKnownStatuses, urlsToCache)
 	incrementDiscoveredStatusCounters(len(links), newStatusCount, now)
 }
 
@@ -153,73 +123,23 @@ func splitDomains(host string) (string, string) {
 }
 
 func statusExistenceMap(hashKey string, links []discoveredLink) map[string]bool {
-	if len(links) == 0 {
-		return map[string]bool{}
-	}
-
-	pipe := db.Rdb.Pipeline()
-	cmds := make([]*redis.BoolCmd, len(links))
-	for i, link := range links {
-		cmds[i] = pipe.HExists(db.Ctx, hashKey, link.url)
-	}
-	_, _ = pipe.Exec(db.Ctx)
-
-	result := make(map[string]bool, len(links))
-	for i, cmd := range cmds {
-		exists, err := cmd.Result()
-		if err != nil {
-			continue
-		}
-		result[links[i].url] = exists
-	}
-
-	return result
+	return storage.FromGlobals().StatusExistenceMap(hashKey, links)
 }
 
 func cacheKnownStatuses(hashKey string, urls []string) {
-	if len(urls) == 0 {
-		return
-	}
-
-	values := make([]any, 0, len(urls)*2)
-	for _, url := range urls {
-		values = append(values, url, 1)
-	}
-	db.Rdb.HSet(db.Ctx, hashKey, values...).Err()
+	storage.FromGlobals().CacheKnownStatuses(hashKey, urls)
 }
 
 func incrementDiscoveredStatusCounters(allCount, newCount int, now time.Time) {
-	pipe := db.Rdb.Pipeline()
-	if allCount > 0 {
-		key := tools.MinuteBucketKey("ese_spider_all_status_in_minute_", now)
-		pipe.IncrBy(db.Ctx, key, int64(allCount))
-		pipe.Expire(db.Ctx, key, time.Hour)
-	}
-	if newCount > 0 {
-		key := tools.MinuteBucketKey("ese_spider_new_status_in_minute_", now)
-		pipe.IncrBy(db.Ctx, key, int64(newCount))
-		pipe.Expire(db.Ctx, key, time.Hour)
-	}
-	_, _ = pipe.Exec(db.Ctx)
+	storage.FromGlobals().IncrementDiscoveredStatusCounters(allCount, newCount, now)
 }
 
 func incrementHostCrawlWindows(host string, now time.Time) {
-	pipe := db.Rdb.Pipeline()
-	for _, window := range crawlRateWindows {
-		key := tools.WindowBucketKey("ese_spider_xianliu_", host, window.seconds, now)
-		pipe.IncrBy(db.Ctx, key, 1)
-		pipe.Expire(db.Ctx, key, time.Second*time.Duration(window.seconds))
-	}
-	_, _ = pipe.Exec(db.Ctx)
+	storage.FromGlobals().IncrementHostCrawlWindows(host, storageCrawlRateWindows(), now)
 }
 
 func addHostToBlacklist(host string) {
-	db.Rdb.SAdd(db.Ctx, "ese_spider_host_black_list", host)
-
-	ttl, _ := db.Rdb.TTL(db.Ctx, "ese_spider_host_black_list").Result()
-	if ttl == -1 {
-		db.Rdb.Expire(db.Ctx, "ese_spider_host_black_list", time.Minute*42).Err()
-	}
+	storage.FromGlobals().AddHostToBlacklist(host)
 }
 
 func runWorkerPool(jobCount, workerCount int, fn func(int) int) int {

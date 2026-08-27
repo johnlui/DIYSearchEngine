@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -8,7 +9,6 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/johnlui/enterprise-search-engine/db"
 	"github.com/johnlui/enterprise-search-engine/models"
 )
 
@@ -21,7 +21,11 @@ var client = &http.Client{
 }
 
 func Curl(status models.Status) (*goquery.Document, int) {
-	req, err := http.NewRequest(http.MethodGet, status.Url, nil)
+	return CurlContext(context.Background(), status)
+}
+
+func CurlContext(ctx context.Context, status models.Status) (*goquery.Document, int) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, status.Url, nil)
 	if err != nil {
 		return curlFailureResult(status)
 	}
@@ -48,18 +52,17 @@ func Curl(status models.Status) (*goquery.Document, int) {
 	return doc, 1
 }
 
-var countCurlFailure = func(status models.Status) int {
-	// 网络错误则使用Redis判断次数，达到3次则标记为 craw_done
-	key := "ese_spider_wangluocuowu_" + GetMD5Hash(status.Url)
+var countCurlFailure = defaultCurlFailureCounter
 
-	count, err := db.Rdb.Get(db.Ctx, key).Int()
-	if err == nil && count >= 2 { // 超时放弃次数
-		return 4
+func SetCurlFailureCounter(fn func(models.Status) int) {
+	if fn == nil {
+		countCurlFailure = defaultCurlFailureCounter
+		return
 	}
+	countCurlFailure = fn
+}
 
-	db.Rdb.IncrBy(db.Ctx, key, 1).Err()
-	db.Rdb.Expire(db.Ctx, key, time.Hour*240).Err()
-
+func defaultCurlFailureCounter(models.Status) int {
 	return 2
 }
 

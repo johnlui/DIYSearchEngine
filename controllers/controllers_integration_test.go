@@ -37,6 +37,9 @@ func setupControllerDB(t *testing.T) *gorm.DB {
 	if err := dbInstance.Table("word_dics").AutoMigrate(&models.WordDic{}); err != nil {
 		t.Fatalf("migrate word_dics: %v", err)
 	}
+	if err := dbInstance.AutoMigrate(&models.WordPosting{}); err != nil {
+		t.Fatalf("migrate word_postings: %v", err)
+	}
 	if err := dbInstance.Table("pages_00").AutoMigrate(&models.Page{}); err != nil {
 		t.Fatalf("migrate pages_00: %v", err)
 	}
@@ -110,6 +113,30 @@ func TestLoadWordDicsAndPagesByDocKey(t *testing.T) {
 	pages := loadPagesByDocKey([]string{"bad", "0-1", "x-2"})
 	if pages["0-1"].Title != "Hello" || len(pages) != 1 {
 		t.Fatalf("loadPagesByDocKey() = %#v", pages)
+	}
+}
+
+func TestLoadDocPartsByWordPrefersStructuredPostings(t *testing.T) {
+	dbInstance := setupControllerDB(t)
+
+	dbInstance.Table("word_dics").Create(&models.WordDic{Name: "hello", Positions: "0,1,1,100,0-0,2,1,100,0-"})
+	dbInstance.Table("word_postings").Create(&models.WordPosting{
+		Term:          "hello",
+		TableIndex:    0,
+		DocID:         2,
+		TermFrequency: 7,
+		DocLength:     120,
+		Positions:     "3",
+	})
+
+	partsByWord := loadDocPartsByWord([]string{"hello"})
+	parts := partsByWord["hello"]
+	partsByDocID := make(map[uint]docPart, len(parts))
+	for _, part := range parts {
+		partsByDocID[part.docID] = part
+	}
+	if len(partsByDocID) != 2 || partsByDocID[1].termFrequency != 1 || partsByDocID[2].termFrequency != 7 {
+		t.Fatalf("parts = %#v", parts)
 	}
 }
 

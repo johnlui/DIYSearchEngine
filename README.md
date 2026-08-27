@@ -777,7 +777,16 @@ RQiDj := (float64(Fi) * (k1 + 1)) / (float64(Fi) + k1*(1-b+b*(float64(Dj)/avgDoc
 3. 修改配置文件：`cp .env.example .env`，然后把里面的数据库和 Redis 配置改成你的
 4. 执行`./ese art init`创建数据库
 5. 手动插入一个真实的 URL 到 pages_00 表中，只需要填充 url 和 host 两个字段
-6. 执行`./ese`，静待好事发生 ☕️
+6. 执行`./ese`或`./ese all`，静待好事发生 ☕️
+
+如果需要按角色独立部署，可以使用下面的命令：
+
+1. Web 查询服务：`./ese serve`
+2. 爬虫 worker：`./ese crawler`
+3. 后台调度器：`./ese scheduler`
+4. 字典转移 worker：`./ese indexer`
+
+常用吞吐参数可以直接在`.env`中调整：`CRAWL_BATCH`、`CRAWL_WORKERS`、`PREPARE_BATCH`、`INDEX_PAGES_PER_SHARD`、`INDEX_TRANSFER_BATCH`、`INDEX_TRANSFER_WORD_DEPTH`。
 
 过一段时间，等字典数据表`word_dics`里面填充了数据之后，打开[http://127.0.0.1:10086](http://127.0.0.1:10086)，尝试搜一下吧！🔍
 
@@ -803,4 +812,3 @@ RQiDj := (float64(Fi) * (k1 + 1)) / (float64(Fi) + k1*(1-b+b*(float64(Dj)/avgDoc
 ### 代码版权
 
 本项目代码采用 MIT 协议开源。
-

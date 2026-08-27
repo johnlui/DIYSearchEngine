@@ -1,5 +1,5 @@
 # 使用 golang 官方镜像作为基础镜像
-FROM golang:latest AS builder
+FROM golang:1.22-bookworm AS builder
 
 # 设置工作目录
 WORKDIR /app
@@ -13,27 +13,26 @@ COPY . .
 # 编译项目
 RUN go build -o ese *.go
 
-# 使用 Alpine Linux 作为基础镜像
-FROM alpine:latest
+# 使用 Debian slim，避免 CGO/gojieba 二进制在 musl 环境中运行失败
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
 
 # 设置工作目录
 WORKDIR /app
 
 # 从前一个镜像中拷贝编译好的可执行文件到当前镜像
 COPY --from=builder /app/ese .
+COPY --from=builder /app/views ./views
+COPY --from=builder /app/dict ./dict
 
 # 拷贝配置文件
 COPY .env.example .env
-
-# 替换配置文件中的数据库和 Redis 配置
-
-# 初始化数据库
-RUN ./ese art init
-
-# 手动插入一个真实的 URL 到 pages_00 表中
 
 # 暴露端口
 EXPOSE 8080
 
 # 启动应用
-CMD ["./ese"]
+CMD ["./ese", "all"]

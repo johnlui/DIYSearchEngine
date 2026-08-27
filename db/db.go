@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	"github.com/johnlui/enterprise-search-engine/config"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -33,14 +34,11 @@ var makeMysqlDialector = mysql.Open
 var openGorm = gorm.Open
 
 func InitDB() {
-	// 初始化 GORM
+	InitDBWithConfig(config.Load())
+}
 
-	// 默认仓库数据库
-	dsn0 := os.Getenv("DB_USERNAME0") + ":" +
-		os.Getenv("DB_PASSWORD0") + "@(" +
-		os.Getenv("DB_HOST0") + ":" +
-		os.Getenv("DB_PORT0") + ")/" +
-		os.Getenv("DB_DATABASE0") + "?charset=utf8mb4&parseTime=True&loc=Local"
+func InitDBWithConfig(cfg config.Config) {
+	// 初始化 GORM
 
 	// 如果你有多个数据库，可以取消注释，注册新的 DSN 信息
 	// dsn1 := os.Getenv("DB_USERNAME1") + ":" +
@@ -49,20 +47,13 @@ func InitDB() {
 	//   os.Getenv("DB_PORT1") + ")/" +
 	//   os.Getenv("DB_DATABASE1") + "?charset=utf8mb4&parseTime=True&loc=Local"
 
-	// 字典数据库
-	dsnDic := os.Getenv("DB_USERNAME_DIC") + ":" +
-		os.Getenv("DB_PASSWORD_DIC") + "@(" +
-		os.Getenv("DB_HOST_DIC") + ":" +
-		os.Getenv("DB_PORT_DIC") + ")/" +
-		os.Getenv("DB_DATABASE_DIC") + "?charset=utf8mb4&parseTime=True&loc=Local"
-
 	file, err := os.OpenFile("gorm-log.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		log.Fatalf("open gorm log file: %v", err)
 	}
 
 	logLevel := logger.Warn
-	if os.Getenv("APP_DEBUG") == "true" {
+	if cfg.AppDebug {
 		logLevel = logger.Info
 	}
 	fileLogger := logger.New(
@@ -79,18 +70,18 @@ func InitDB() {
 		Logger: fileLogger,
 	}
 
-	DbInstance0 = openDB("pages", dsn0, &gormConfig)
+	DbInstance0 = openDB("pages", cfg.PagesDB.DSN(), &gormConfig)
 	// DbInstance1 = mustOpenDB("pages-1", dsn1, &gormConfig)
-	DbInstanceDic = openDB("dictionary", dsnDic, &gormConfig)
+	DbInstanceDic = openDB("dictionary", cfg.DictionaryDB.DSN(), &gormConfig)
 
-	configurePool("pages", DbInstance0, 1, 20)
-	configurePool("dictionary", DbInstanceDic, 1, 20)
+	configurePool("pages", DbInstance0, cfg.PagesDB.MaxIdle, cfg.PagesDB.MaxOpen)
+	configurePool("dictionary", DbInstanceDic, cfg.DictionaryDB.MaxIdle, cfg.DictionaryDB.MaxOpen)
 
 	// 初始化 Redis
 	// 默认 Redis，用作缓存
-	Rdb = createRedisClient(0)
+	Rdb = createRedisClientFromConfig(cfg.Redis)
 	// 倒排索引字典生成中转站
-	Rdb10 = createRedisClient(10)
+	Rdb10 = createRedisClientFromConfig(cfg.IndexRedis)
 
 	pingRedis("redis-0", Rdb)
 	pingRedis("redis-10", Rdb10)
@@ -120,12 +111,16 @@ func configureDBPool(name string, dbInstance *gorm.DB, maxIdle, maxOpen int) {
 }
 
 func newRedisClient(dbIndex int) *redis.Client {
+	return createRedisClientFromConfig(config.Load().RedisWithDB(dbIndex))
+}
+
+func createRedisClientFromConfig(cfg config.Redis) *redis.Client {
 	return redis.NewClient(&redis.Options{
-		Addr:        os.Getenv("REDIS_HOST") + os.Getenv("REDIS_PORT"),
-		Password:    os.Getenv("REDIS_PASSWORD"),
-		DB:          dbIndex,
-		DialTimeout: time.Second,
-		ReadTimeout: time.Second,
+		Addr:        cfg.Addr,
+		Password:    cfg.Password,
+		DB:          cfg.DB,
+		DialTimeout: time.Second * time.Duration(cfg.DialSeconds),
+		ReadTimeout: time.Second * time.Duration(cfg.ReadSeconds),
 	})
 }
 
